@@ -4,7 +4,55 @@ import joblib
 import numpy as np
 import pandas as pd
 from math import log2
+from bcc import BPF
+import ctypes
+import joblib
+import subprocess
+import sys
+from bcc import libbcc
 
+class Node(ctypes.Structure):
+    _fields_ = [
+        ("left_idx", ctypes.c_int),
+        ("right_idx", ctypes.c_int),
+        ("split_value", ctypes.c_int),  # fixed thường là int
+        ("feature_idx", ctypes.c_int),
+        ("is_leaf", ctypes.c_uint32),
+        ("label", ctypes.c_int),
+        ("tree_idx", ctypes.c_int),
+    ]
+
+
+def load_nodes_to_map(df: pd.DataFrame, MAP_PATH: str):
+
+    map_fd = libbcc.lib.bpf_obj_get(MAP_PATH.encode())
+    if map_fd < 0:
+        raise OSError(f"Failed to open pinned map at {MAP_PATH}")
+
+    print(f"[LOAD] Opened pinned map: {MAP_PATH}")
+    print(f"[LOAD] Total nodes: {len(df)}")
+
+    df = df.reset_index(drop=True)
+
+    for global_idx, row in df.iterrows():
+
+        key = global_idx.to_bytes(4, "little", signed=False)
+
+        val = (
+            int(row["left_idx"]).to_bytes(4, "little", signed=True) +
+            int(row["right_idx"]).to_bytes(4, "little", signed=True) +
+            int(row["split_value"]).to_bytes(8, "little", signed=False) +
+            int(row["feature_idx"]).to_bytes(4, "little", signed=True) +
+            int(row["is_leaf"]).to_bytes(4, "little", signed=False) +
+            int(row["label"]).to_bytes(4, "little", signed=True) +
+            int(row["tree_idx"]).to_bytes(4, "little", signed=True)
+        )
+
+        ret = libbcc.lib.bpf_update_elem(map_fd, key, val, 0)
+        if ret != 0:
+            print(f"[LOAD] Failed at index {global_idx}")
+
+    print("[LOAD] All nodes inserted successfully.")
 
 SCALE_BITS = 16
 SCALE = 1 << SCALE_BITS
@@ -82,13 +130,22 @@ def dump_random_forest(model_path: str):
     classes = list(model.classes_)
     label_map = {c: i for i, c in enumerate(classes)}
 
+    global_offset = 0
+
     for tree_idx, estimator in enumerate(model.estimators_):
         tree = estimator.tree_
+        node_count = tree.node_count
 
-        for node_idx in range(tree.node_count):
+        for node_idx in range(node_count):
             left = tree.children_left[node_idx]
             right = tree.children_right[node_idx]
             is_leaf = int(left == -1 and right == -1)
+
+            # Convert local index → global index
+            if left != -1:
+                left += global_offset
+            if right != -1:
+                right += global_offset
 
             label = -1
             if is_leaf:
@@ -99,14 +156,17 @@ def dump_random_forest(model_path: str):
 
             rows.append({
                 "tree_idx": tree_idx,
-                "node_idx": node_idx,
                 "feature_idx": int(tree.feature[node_idx]),
-                "split_value": float(tree.threshold[node_idx]),
-                "left_child": int(left),
-                "right_child": int(right),
+                "split_value": float_to_fixed_u64(
+                    float(tree.threshold[node_idx])
+                ),
+                "left_idx": int(left),
+                "right_idx": int(right),
                 "is_leaf": is_leaf,
                 "label": label,
             })
+
+        global_offset += node_count
 
     df = pd.DataFrame(rows)
 
@@ -360,12 +420,21 @@ static __always_inline fixed fixed_pow(fixed base, __u32 exp)
 # MAIN
 # ============================================================
 
+def run(cmd):
+    """Chạy lệnh shell và in log rõ ràng"""
+    print(f"\n[RUN] {cmd}")
+    result = subprocess.run(cmd, shell=True)
+    if result.returncode != 0:
+        print(f"Lỗi khi chạy: {cmd}")
+        sys.exit(1)
+
 def main():
 
     parser = argparse.ArgumentParser(
         description="Auto-extract RandomForest info from model"
     )
     parser.add_argument("--model", required=True, help="Path to model.pkl")
+    parser.add_argument("--iface", required=True, help="Interface to attach prog")
     parser.add_argument(
         "--output_header",
         default="../include/common_kern_user.h",
@@ -373,13 +442,20 @@ def main():
     )
 
     args = parser.parse_args()
-
+    IFACE = args.iface
     df, max_tree, max_nodes_per_tree, max_depth = dump_random_forest(
         args.model
     )
 
     model = joblib.load(args.model)
     max_features = model.n_features_in_
+    classes = list(model.classes_)
+    
+    print("\n[LABEL INFO]")
+    print("Number of labels:", len(classes))
+
+    for i, c in enumerate(classes):
+        print(f"Label {i}: {c}")
 
     generate_common_header(
         args.output_header,
@@ -395,6 +471,16 @@ def main():
     print("Max depth:", max_depth)
     print("Features:", max_features)
     print("Total nodes:", len(df))
+    # Load BPF program
+    XDP_LOADER_PATH = "/home/dongtv/qos_paper/online_detect/build/xdp_loader"
+    run(f"sudo {XDP_LOADER_PATH} -S --dev {IFACE} --progname classification")
+
+    # Load nodes into map
+    MAP_PATH = f"/sys/fs/bpf/{IFACE}/xdp_randforest_nodes"
+    # fd = os.open(MAP_PATH, os.O_RDWR)
+    load_nodes_to_map(df, MAP_PATH)
+
+    print("[INFO] Nodes loaded into xdp_randforest_nodes map")
 
 
 if __name__ == "__main__":

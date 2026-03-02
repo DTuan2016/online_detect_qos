@@ -475,6 +475,9 @@ int stage9(struct xdp_md *ctx)
         fv->votes[i] = 0;
 
     rewrite_packet(ctx, best_label);
+
+    bpf_printk("LABLE IS: %d", best_label);
+    
     __u32 other_interface = 9;
     // bpf_redirect(other_interface, 0);
    

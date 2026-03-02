@@ -68,36 +68,85 @@ const char *map_name    =  "xdp_flow_tracking";
 
 int verbose = 1;
 
-struct xdp_program *load_bpf_and_xdp_attach(struct config *cfg)
+struct bpf_object *
+load_bpf_and_xdp_attach(struct config *cfg)
 {
-	int prog_fd = -1;
-	int err;
+    struct bpf_object *obj;
+    struct bpf_program *prog;
+    int err;
 
-	DECLARE_LIBBPF_OPTS(bpf_object_open_opts, opts);
-	DECLARE_LIBXDP_OPTS(xdp_program_opts, xdp_opts, 0);
+	obj = bpf_object__open_file(cfg->filename, NULL);
+    if (libbpf_get_error(obj)) {
+        fprintf(stderr, "ERR: opening BPF object file\n");
+        return NULL;
+    }
 
-	xdp_opts.open_filename = cfg->filename;
-	xdp_opts.prog_name = cfg->progname;
-	xdp_opts.opts = &opts;
-	struct xdp_program *prog = xdp_program__create(&xdp_opts);
-	err = libxdp_get_error(prog);
-	if (err) {
-		char errmsg[1024];
-		libxdp_strerror(err, errmsg, sizeof(errmsg));
-		fprintf(stderr, "ERR: loading program: %s\n", errmsg);
-		exit(EXIT_FAIL_BPF);
-	}
-	err = xdp_program__attach(prog, cfg->ifindex, cfg->attach_mode, 0);
-	if (err)
-		exit(err);
+	err = bpf_object__load(obj);
+    if (err) {
+        fprintf(stderr, "ERR: loading BPF object: %d\n", err);
+        return NULL;
+    }
 
-	prog_fd = xdp_program__fd(prog);
-	if (prog_fd < 0) {
-		fprintf(stderr, "ERR: xdp_program__fd failed: %s\n", strerror(errno));
-		exit(EXIT_FAIL_BPF);
-	}
+	prog = bpf_object__find_program_by_name(obj, "classification");
+    if (!prog) {
+        fprintf(stderr, "ERR: cannot find program 'classification'\n");
+        return NULL;
+    }
 
-	return prog;
+    int prog_fd = bpf_program__fd(prog);
+    if (prog_fd < 0) {
+        fprintf(stderr, "ERR: getting prog fd\n");
+        return NULL;
+    }
+
+    err = bpf_xdp_attach(cfg->ifindex, prog_fd,
+                         cfg->attach_mode, NULL);
+    if (err) {
+        fprintf(stderr, "ERR: attaching XDP: %s\n",
+                strerror(-err));
+        return NULL;
+    }
+
+    printf("✔ Attached classification to %s\n", cfg->ifname);
+
+    int map_fd = bpf_object__find_map_fd_by_name(obj, "prog_array");
+    if (map_fd < 0) {
+        fprintf(stderr, "ERR: cannot find prog_array map\n");
+        return NULL;
+    }
+
+    for (int i = 0; i < 10; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "stage%d", i);
+
+        struct bpf_program *stage =
+            bpf_object__find_program_by_name(obj, name);
+
+        if (!stage) {
+            fprintf(stderr, "ERR: cannot find %s\n", name);
+            return NULL;
+        }
+
+        int fd = bpf_program__fd(stage);
+        if (fd < 0) {
+            fprintf(stderr, "ERR: fd of %s invalid\n", name);
+            return NULL;
+        }
+
+        __u32 key = i;
+        err = bpf_map_update_elem(map_fd, &key, &fd, 0);
+        if (err) {
+            fprintf(stderr,
+                "ERR: updating prog_array[%d]\n", i);
+            return NULL;
+        }
+
+        printf("[S] prog_array[%d] = %s\n", i, name);
+    }
+
+    printf("[S] Tail-call map initialized\n");
+
+    return obj;
 }
 
 int pin_maps_in_bpf_object(struct bpf_object *bpf_obj, const char *subdir){
@@ -151,7 +200,7 @@ int remove_pin_dir(const char *path)
 }
 
 int main(int argc, char **argv){
-    struct xdp_program * program;
+    // struct xdp_program * program;
 
     int err, len;
     struct config cfg = {
@@ -196,14 +245,15 @@ int main(int argc, char **argv){
             printf("Success: XDP program detached from %s\n",
                 cfg.ifname);
         remove_pin_dir(cfg.pin_dir);
-		const char *xdp_path_dir = "/sys/fs/bpf/xdp";
-		remove_pin_dir(xdp_path_dir);
+		// const char *xdp_path_dir = "/sys/fs/bpf/xdp";
+		// remove_pin_dir(xdp_path_dir);
         
         return EXIT_OK;
     }
 
-	program = load_bpf_and_xdp_attach(&cfg);
-	if (!program)
+	struct bpf_object *obj;
+	obj = load_bpf_and_xdp_attach(&cfg);
+	if (!obj)
 		return EXIT_FAIL_BPF;
 
 	if (verbose) {
@@ -213,8 +263,7 @@ int main(int argc, char **argv){
 		       cfg.ifname, cfg.ifindex);
 	}
 
-	/* Use the --dev name as subdir for exporting/pinning maps */
-	err = pin_maps_in_bpf_object(xdp_program__bpf_obj(program), cfg.ifname);
+	err = pin_maps_in_bpf_object(obj, cfg.ifname);
 	if (err) {
 		fprintf(stderr, "ERR: pinning maps\n");
 		return err;

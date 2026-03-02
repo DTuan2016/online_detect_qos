@@ -253,7 +253,7 @@ static __always_inline int update_stats(struct flow_key *key,
     __u64 pkt_len = (__u64)((__u8 *)((void *)(long)ctx->data_end) -
                              (__u8 *)((void *)(long)ctx->data));
 
-    int ret = XDP_PASS;
+    int detect = 0;
     data_point *dp = bpf_map_lookup_elem(&xdp_flow_tracking, key);
     if (!dp) {
         data_point zero = {};
@@ -266,9 +266,9 @@ static __always_inline int update_stats(struct flow_key *key,
         zero.total_bytes = pkt_len;
 
         if (bpf_map_update_elem(&xdp_flow_tracking, key, &zero, BPF_ANY) != 0)
-            return ret;
+            return XDP_PASS;
 
-        return ret;
+        return XDP_PASS;
     }
 
     __u64 iat_ns = (dp->last_seen > 0 && ts_ns >= dp->last_seen) ? ts_ns - dp->last_seen : 0;
@@ -292,14 +292,13 @@ static __always_inline int update_stats(struct flow_key *key,
     dp->features[QS_FEATURE_FWD_PACKET_LENGTH_MIN] = fixed_from_uint(dp->min_pkt_len);
     dp->features[QS_FEATURE_FWD_IAT_MIN] = fixed_from_uint(dp->min_IAT);
 
-    if((dp->features[QS_FEATURE_FLOW_DURATION]) >= FLOW_LEVEL_DUR_NS || (dp->features[QS_FEATURE_TOTAL_FWD_PACKET] >= FLOW_LEVEL_PKTS)){
-        int pred = predict_forest(dp);
-        dp->label = pred;
-        rewrite_packet(ctx, pred);
+    if((dp->features[QS_FEATURE_FLOW_DURATION]) == FLOW_LEVEL_DUR_NS || (dp->features[QS_FEATURE_TOTAL_FWD_PACKET] >= FLOW_LEVEL_PKTS)){
+        detect = 1;
     }
 
-    return ret;
+    return detect;
 }
+
 static __always_inline int process_stage(struct xdp_md *ctx,
                                          data_point *dp,
                                          __u32 stage_id,
@@ -352,9 +351,15 @@ static __always_inline data_point *get_dp_from_ctx(struct xdp_md *ctx)
 SEC("xdp")
 int stage0(struct xdp_md *ctx)
 {
+    bpf_printk("HERE_IS_STAGE_0");
     data_point *dp = get_dp_from_ctx(ctx);
     if (!dp)
+    {
+        bpf_printk("GET_DP_FAIL");
         return XDP_PASS;
+    }
+        
+    bpf_printk("GET_DP_SUCCESS");
     return process_stage(ctx, dp, 0, 0, 25);
 }
 
@@ -480,12 +485,14 @@ int stage9(struct xdp_md *ctx)
 SEC("xdp")
 int classification(struct xdp_md *ctx)
 {
+    bpf_printk("START CLASSIFICATION");
     struct flow_key key = {};
     __u64 pkt_len = 0;
     __u32 vote_key = 0;
 
     struct forest_vote *fv;
     int ret = parse_packet_get_data(ctx, &key, &pkt_len);
+    bpf_printk("DONE PARSE PACKET");
 
     if (ret == -2)      /* LLDP */
         return XDP_DROP;
@@ -493,22 +500,24 @@ int classification(struct xdp_md *ctx)
     if (ret < 0)
         return XDP_PASS;
 
-    ret = update_stats(&key, ctx);
-
-    if (ret == XDP_PASS) {
+    int detect = update_stats(&key, ctx);
+    bpf_printk("DONE UPDATE STATS");
+    if (detect == 0) {
         return XDP_PASS;
     }
-    fv = bpf_map_lookup_elem(&forest_vote_map, &vote_key);
-    if (!fv)
+    else{
+        fv = bpf_map_lookup_elem(&forest_vote_map, &vote_key);
+        if (!fv)
+            return XDP_PASS;
+
+    #pragma unroll
+        for (int i = 0; i < NUM_LABELS; i++)
+            fv->votes[i] = 0;
+
+        bpf_printk("JUMP_TO_STAGE_0");
+        bpf_tail_call(ctx, &prog_array, 0);
         return XDP_PASS;
-
-#pragma unroll
-    for (int i = 0; i < NUM_LABELS; i++)
-        fv->votes[i] = 0;
-
-    bpf_printk("JUMP_TO_STAGE_0");
-    bpf_tail_call(ctx, &prog_array, 0);
-    return XDP_PASS;
+    }
 }
 
 char LICENSE[] SEC("license") = "GPL";

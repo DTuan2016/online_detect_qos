@@ -51,7 +51,7 @@ struct forest_vote {
 };
 
 struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, struct forest_vote);
@@ -535,8 +535,9 @@ int stage10(struct xdp_md *ctx)
     rewrite_packet(ctx, best_label);
 
     bpf_printk("LABLE IS: %d", best_label);
+    dp->label = best_label;
     
-    __u32 other_interface = 9;
+    __u32 other_interface = 8;
     // bpf_redirect(other_interface, 0);
    
     return bpf_redirect(other_interface, 0);

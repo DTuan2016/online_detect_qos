@@ -183,6 +183,7 @@ def generate_common_header(
     max_nodes: int,
     max_depth: int,
     max_features: int,
+    num_packets: int,
 ):
 
     header = f"""#ifndef COMMON_KERNEL_USER_H
@@ -198,18 +199,19 @@ def generate_common_header(
 #define MAX_FEATURES        {max_features}
 #define MAX_DEPTH           {max_depth}
 #define TOTAL_NODES         {max_tree * max_nodes}
-#define MAX_FLOW_SAVED      1000
+#define NUM_PACKET          {num_packets}
+#define MAX_FLOW_SAVED      10000
 #define NUM_LABELS          7
 
-#define QS_FEATURE_FLOW_DURATION                0
-#define QS_FEATURE_TOTAL_FWD_PACKET             1
-#define QS_FEATURE_TOTAL_LENGTH_OF_FWD_PACKET   2
-#define QS_FEATURE_FWD_PACKET_LENGTH_MAX        3
-#define QS_FEATURE_FWD_PACKET_LENGTH_MIN        4
-#define QS_FEATURE_FWD_IAT_MIN                  5
-
-#define FLOW_LEVEL_PKTS                      6
-#define FLOW_LEVEL_DUR_NS                    100
+#define FEATURE_NB_PACKET   0
+#define FEATURE_MIN_IAT     1
+#define FEATURE_MAX_IAT     2
+#define FEATURE_SUM_IAT     3
+#define FEATURE_MEAN_IAT    4
+#define FEATURE_MIN_LEN     5
+#define FEATURE_MAX_LEN     6
+#define FEATURE_SUM_LEN     7
+#define FEATURE_MEAN_LEN    8
 
 typedef __u64               fixed;
 
@@ -234,11 +236,18 @@ struct flow_key {{
 typedef struct {{
     __u64   start_ts;             /* Timestamp of first packet */
     __u64   last_seen;            /* Timestamp of last packet */
-    __u64   min_IAT;              /* Minimum Inter-Arrival Time */
     __u32   total_pkts;           /* Total packet count */
-    __u32   max_pkt_len;          /* Maximum packet length */
-    __u32   min_pkt_len;          /* Minimum packet length */
     __u32   total_bytes;          /* Total byte count */
+    /*IAT FEATURES*/
+    __u64   min_iat;              /* Minimum Inter-Arrival Time */
+    __u64   max_iat;              /* Minimum Inter-Arrival Time */
+    __u64   sum_iat; 
+    __u64   mean_iat;
+    /*PACKET LENGTH FEATURES*/
+    __u32   min_len;          /* Maximum packet length */
+    __u32   max_len;          /* Minimum packet length */
+    __u32   sum_len;
+    __u32   mean_len;
     fixed   features[MAX_FEATURES];
     int     label;
 }} data_point;
@@ -419,11 +428,13 @@ static __always_inline fixed fixed_pow(fixed base, __u32 exp)
 # ============================================================
 # MAIN
 # ============================================================
-
-def run(cmd):
-    """Chạy lệnh shell và in log rõ ràng"""
+def run(cmd, cwd=None):
     print(f"\n[RUN] {cmd}")
-    result = subprocess.run(cmd, shell=True)
+    result = subprocess.run(
+        cmd,
+        shell=True,
+        cwd=os.path.expanduser(cwd) if cwd else None
+    )
     if result.returncode != 0:
         print(f"Lỗi khi chạy: {cmd}")
         sys.exit(1)
@@ -435,6 +446,7 @@ def main():
     )
     parser.add_argument("--model", required=True, help="Path to model.pkl")
     parser.add_argument("--iface", required=True, help="Interface to attach prog")
+    parser.add_argument("--nb_packet", required=True, help="Add your number of packets")
     parser.add_argument(
         "--output_header",
         default="../include/common_kern_user.h",
@@ -442,6 +454,7 @@ def main():
     )
 
     args = parser.parse_args()
+    NUM_PACKET = args.nb_packet
     IFACE = args.iface
     df, max_tree, max_nodes_per_tree, max_depth = dump_random_forest(
         args.model
@@ -463,6 +476,7 @@ def main():
         max_nodes_per_tree,
         max_depth,
         max_features,
+        NUM_PACKET,
     )
 
     print("\n[MODEL INFO]")
@@ -472,9 +486,14 @@ def main():
     print("Features:", max_features)
     print("Total nodes:", len(df))
     # Load BPF program
-    XDP_LOADER_PATH = "/home/dongtv/qos_paper/online_detect/build/xdp_loader"
-    run(f"sudo {XDP_LOADER_PATH} -S --dev {IFACE} --progname classification")
+    BUILD_DIR = "~/online_detect_qos/build"
+    XDP_LOADER_PATH = os.path.expanduser("~/online_detect_qos/build/xdp_loader")
 
+    # build
+    run("make", cwd=BUILD_DIR)
+
+    # load XDP
+    run(f"sudo {XDP_LOADER_PATH} -S --dev {IFACE} --progname classification")
     # Load nodes into map
     MAP_PATH = f"/sys/fs/bpf/{IFACE}/xdp_randforest_nodes"
     # fd = os.open(MAP_PATH, os.O_RDWR)

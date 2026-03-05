@@ -6,23 +6,24 @@
 /* Fixed-point configuration */
 #define FIXED_SHIFT         16
 #define FIXED_SCALE         65536
-#define MAX_TREES           250
-#define MAX_NODE_PER_TREE   1921
-#define MAX_FEATURES        21
-#define MAX_DEPTH           30
-#define TOTAL_NODES         480250
-#define MAX_FLOW_SAVED      1000
+#define MAX_TREES           300
+#define MAX_NODE_PER_TREE   2569
+#define MAX_FEATURES        9
+#define MAX_DEPTH           14
+#define TOTAL_NODES         770700
+#define NUM_PACKET          10
+#define MAX_FLOW_SAVED      10000
 #define NUM_LABELS          7
 
-#define QS_FEATURE_FLOW_DURATION                0
-#define QS_FEATURE_TOTAL_FWD_PACKET             1
-#define QS_FEATURE_TOTAL_LENGTH_OF_FWD_PACKET   2
-#define QS_FEATURE_FWD_PACKET_LENGTH_MAX        3
-#define QS_FEATURE_FWD_PACKET_LENGTH_MIN        4
-#define QS_FEATURE_FWD_IAT_MIN                  5
-
-#define FLOW_LEVEL_PKTS                      6
-#define FLOW_LEVEL_DUR_NS                    100
+#define FEATURE_NB_PACKET   0
+#define FEATURE_MIN_IAT     1
+#define FEATURE_MAX_IAT     2
+#define FEATURE_SUM_IAT     3
+#define FEATURE_MEAN_IAT    4
+#define FEATURE_MIN_LEN     5
+#define FEATURE_MAX_LEN     6
+#define FEATURE_SUM_LEN     7
+#define FEATURE_MEAN_LEN    8
 
 typedef __u64               fixed;
 
@@ -47,11 +48,18 @@ struct flow_key {
 typedef struct {
     __u64   start_ts;             /* Timestamp of first packet */
     __u64   last_seen;            /* Timestamp of last packet */
-    __u64   min_IAT;              /* Minimum Inter-Arrival Time */
     __u32   total_pkts;           /* Total packet count */
-    __u32   max_pkt_len;          /* Maximum packet length */
-    __u32   min_pkt_len;          /* Minimum packet length */
     __u32   total_bytes;          /* Total byte count */
+    /*IAT FEATURES*/
+    __u64   min_iat;              /* Minimum Inter-Arrival Time */
+    __u64   max_iat;              /* Minimum Inter-Arrival Time */
+    __u64   sum_iat; 
+    __u64   mean_iat;
+    /*PACKET LENGTH FEATURES*/
+    __u32   min_len;          /* Maximum packet length */
+    __u32   max_len;          /* Minimum packet length */
+    __u32   sum_len;
+    __u32   mean_len;
     fixed   features[MAX_FEATURES];
     int     label;
 } data_point;

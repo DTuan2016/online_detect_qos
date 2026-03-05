@@ -22,7 +22,7 @@ static const char *__doc__ = "XDP loader\n"
 #include "cmd_line.h"
 #include "xdp_loader.h"
 
-static const char *default_filename = "/home/dongtv/qos_paper/online_detect/build/xdp_prog_kern.o";
+static const char *default_filename = "/home/quocanh24/online_detect_qos/build/xdp_prog_kern.o";
 
 static const struct option_wrapper long_options[] = {
 
@@ -115,7 +115,7 @@ load_bpf_and_xdp_attach(struct config *cfg)
         return NULL;
     }
 
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i <= 10; i++) {
         char name[32];
         snprintf(name, sizeof(name), "stage%d", i);
 

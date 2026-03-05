@@ -31,6 +31,7 @@ add_custom_command(
         -O2 -g
         -target bpf
         -D__TARGET_ARCH_x86
+	-I/usr/include/aarch64-linux-gnu
         -I${INC_DIR}
         -I${SRC_DIR}
         -c ${BPF_SRC}
@@ -50,7 +51,18 @@ add_executable(xdp_loader
     ${SRC_DIR}/cmd_line.c
 )
 
+add_executable(dump_csv
+    ${SRC_DIR}/dump_csv.c
+)
+
 target_include_directories(xdp_loader PRIVATE
+    ${INC_DIR}
+    ${SRC_DIR}
+    ${LIBBPF_INCLUDE_DIRS}
+    ${LIBXDP_INCLUDE_DIRS}
+)
+
+target_include_directories(dump_csv PRIVATE
     ${INC_DIR}
     ${SRC_DIR}
     ${LIBBPF_INCLUDE_DIRS}
@@ -60,6 +72,12 @@ target_include_directories(xdp_loader PRIVATE
 target_link_libraries(xdp_loader
     ${LIBBPF_LIBRARIES}
     ${LIBXDP_LIBRARIES}
+    elf
+    z
+)
+
+target_link_libraries(dump_csv
+    ${LIBBPF_LIBRARIES}
     elf
     z
 )

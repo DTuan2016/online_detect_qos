@@ -19,7 +19,7 @@
 
 /* ================= MAPS ================= */
 struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct flow_key);
     __type(value, data_point);
     __uint(max_entries, MAX_FLOW_SAVED);
@@ -41,7 +41,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-    __uint(max_entries, 10);
+    __uint(max_entries, 11);
     __type(key, __u32);
     __type(value, __u32);
 } prog_array SEC(".maps");
@@ -129,9 +129,6 @@ static __always_inline int predict_one_tree(__u32 root_idx, data_point *dp)
             // bpf_printk("NODE LA: idx=%u, label=%d", node_idx, node->label);
             return node->label;
         }
-        // bpf_printk("Tree %d, Depth %d, NodeIdx=%u, Left=%d, Right=%d, Split=%llu, Feature=%d, IsLeaf=%u, Label=%d",
-        //                 node->tree_idx, depth, node_idx, node->left_idx, node->right_idx,
-        //                 node->split_value, node->feature_idx, node->is_leaf, node->label);
         __u32 f_idx = node->feature_idx;
         if (f_idx >= MAX_FEATURES){
             return 0;   
@@ -218,13 +215,13 @@ static __always_inline int rewrite_packet(struct xdp_md *ctx, __u8 label)
 
     /* ===== Map label → DSCP ===== */
     static const __u8 dscp_table[7] = {
-        0,   // label 0
-        8,   // label 1
-        16,  // label 2
-        24,  // label 3
-        32,  // label 4
-        40,  // label 5
-        48   // label 6
+        0,   // label 0 -> BROWSING
+        8,   // label 1 -> CHAT
+        16,  // label 2 -> FT
+        24,  // label 3 -> P2P
+        32,  // label 4 -> STREAMING
+        40,  // label 5 -> VOIP
+        48   // label 6 -> MAIL
     };
 
     if (label >= 7)
@@ -246,55 +243,106 @@ static __always_inline int rewrite_packet(struct xdp_md *ctx, __u8 label)
 }
 
 /* ================= FLOW STATS ================= */
-static __always_inline int update_stats(struct flow_key *key,
-                                                struct xdp_md *ctx)
+static __always_inline int
+update_stats(struct flow_key *key, struct xdp_md *ctx)
 {
     __u64 ts_ns = bpf_ktime_get_ns();
-    __u64 pkt_len = (__u64)((__u8 *)((void *)(long)ctx->data_end) -
-                             (__u8 *)((void *)(long)ctx->data));
+    __u64 pkt_len = (__u64)((__u8 *)(long)ctx->data_end -
+                            (__u8 *)(long)ctx->data);
 
     int detect = 0;
+
     data_point *dp = bpf_map_lookup_elem(&xdp_flow_tracking, key);
     if (!dp) {
         data_point zero = {};
-        zero.start_ts = ts_ns;
-        zero.last_seen = ts_ns;
-        zero.min_IAT = 0xFFFFFFFFFFFFFFFFULL;
-        zero.total_pkts = 1;
-        zero.max_pkt_len = pkt_len;
-        zero.min_pkt_len = pkt_len;
-        zero.total_bytes = pkt_len;
 
-        if (bpf_map_update_elem(&xdp_flow_tracking, key, &zero, BPF_ANY) != 0)
-            return XDP_PASS;
+        zero.start_ts     = ts_ns;
+        zero.last_seen    = ts_ns;
+        zero.total_pkts   = 1;
+        zero.total_bytes  = pkt_len;
 
+        /* IAT init */
+        zero.min_iat  = 0;
+        zero.max_iat  = 0;
+        zero.sum_iat  = 0;
+        zero.mean_iat = 0;
+
+        /* Packet length init */
+        zero.min_len  = pkt_len;
+        zero.max_len  = pkt_len;
+        zero.sum_len  = pkt_len;
+        zero.mean_len = pkt_len << FIXED_SHIFT;
+
+        bpf_map_update_elem(&xdp_flow_tracking, key, &zero, BPF_ANY);
         return XDP_PASS;
     }
 
-    __u64 iat_ns = (dp->last_seen > 0 && ts_ns >= dp->last_seen) ? ts_ns - dp->last_seen : 0;
+    /* ================= UPDATE BASIC ================= */
 
+    /* increment first */
     __sync_fetch_and_add(&dp->total_pkts, 1);
+
+    /* then read updated value */
+    __u64 new_total_pkts = dp->total_pkts;
+
     __sync_fetch_and_add(&dp->total_bytes, pkt_len);
 
-    if (iat_ns > 0 && iat_ns < dp->min_IAT)
-        dp->min_IAT = iat_ns;
-    if (pkt_len > dp->max_pkt_len)
-        dp->max_pkt_len = pkt_len;
-    if (pkt_len < dp->min_pkt_len)
-        dp->min_pkt_len = pkt_len;
+    /* ================= IAT ================= */
+
+    __u64 iat_ns = 0;
+    if (ts_ns >= dp->last_seen)
+        iat_ns = ts_ns - dp->last_seen;
+
+    if (iat_ns > 0) {
+
+        if (dp->min_iat == 0 || iat_ns < dp->min_iat)
+            dp->min_iat = iat_ns;
+
+        if (iat_ns > dp->max_iat)
+            dp->max_iat = iat_ns;
+
+        dp->sum_iat += iat_ns;
+
+        __u64 valid_iats = new_total_pkts - 1;
+        if (valid_iats > 0)
+            dp->mean_iat =
+                (dp->sum_iat << FIXED_SHIFT) / valid_iats;
+    }
+
+    /* ================= PACKET LENGTH ================= */
+
+    if (pkt_len < dp->min_len)
+        dp->min_len = pkt_len;
+
+    if (pkt_len > dp->max_len)
+        dp->max_len = pkt_len;
+
+    dp->sum_len += pkt_len;
+
+    dp->mean_len =
+        (dp->sum_len << FIXED_SHIFT) / new_total_pkts;
+
+    /* ================= UPDATE TIME ================= */
 
     dp->last_seen = ts_ns;
 
-    dp->features[QS_FEATURE_FLOW_DURATION] = fixed_from_uint(dp->last_seen - dp->start_ts);
-    dp->features[QS_FEATURE_TOTAL_FWD_PACKET] = fixed_from_uint(dp->total_pkts);
-    dp->features[QS_FEATURE_TOTAL_LENGTH_OF_FWD_PACKET] = fixed_from_uint(dp->total_bytes);
-    dp->features[QS_FEATURE_FWD_PACKET_LENGTH_MAX] = fixed_from_uint(dp->max_pkt_len);
-    dp->features[QS_FEATURE_FWD_PACKET_LENGTH_MIN] = fixed_from_uint(dp->min_pkt_len);
-    dp->features[QS_FEATURE_FWD_IAT_MIN] = fixed_from_uint(dp->min_IAT);
+    /* ================= FEATURE ARRAY ================= */
 
-    if((dp->features[QS_FEATURE_FLOW_DURATION]) == FLOW_LEVEL_DUR_NS || (dp->features[QS_FEATURE_TOTAL_FWD_PACKET] >= FLOW_LEVEL_PKTS)){
+    dp->features[FEATURE_NB_PACKET] = fixed_from_uint(new_total_pkts);
+    dp->features[FEATURE_MIN_IAT]   = fixed_from_uint(dp->min_iat);
+    dp->features[FEATURE_MAX_IAT]   = fixed_from_uint(dp->max_iat);
+    dp->features[FEATURE_SUM_IAT]   = fixed_from_uint(dp->sum_iat);
+    dp->features[FEATURE_MEAN_IAT]  = dp->mean_iat;
+
+    dp->features[FEATURE_MIN_LEN]   = fixed_from_uint(dp->min_len);
+    dp->features[FEATURE_MAX_LEN]   = fixed_from_uint(dp->max_len);
+    dp->features[FEATURE_SUM_LEN]   = fixed_from_uint(dp->sum_len);
+    dp->features[FEATURE_MEAN_LEN]  = dp->mean_len;
+
+    /* ================= DETECTION ================= */
+
+    if (new_total_pkts >= NUM_PACKET)
         detect = 1;
-    }
 
     return detect;
 }
@@ -313,7 +361,7 @@ static __always_inline int process_stage(struct xdp_md *ctx,
         return XDP_PASS;
 
 #pragma unroll
-    for (int t = 0; t < 25; t++) {
+    for (int t = 0; t < 30; t++) {
         if (t >= tree_count)
             break;
 
@@ -360,7 +408,7 @@ int stage0(struct xdp_md *ctx)
     }
         
     bpf_printk("GET_DP_SUCCESS");
-    return process_stage(ctx, dp, 0, 0, 25);
+    return process_stage(ctx, dp, 0, 0, 30);
 }
 
 SEC("xdp")
@@ -370,7 +418,7 @@ int stage1(struct xdp_md *ctx)
     if (!dp)
         return XDP_PASS;
 
-    return process_stage(ctx, dp, 1, 25, 25);
+    return process_stage(ctx, dp, 1, 30, 30);
 }
 
 SEC("xdp")
@@ -380,7 +428,7 @@ int stage2(struct xdp_md *ctx)
     if (!dp)
         return XDP_PASS;
 
-    return process_stage(ctx, dp, 2, 50, 25);
+    return process_stage(ctx, dp, 2, 60, 30);
 }
 
 SEC("xdp")
@@ -390,7 +438,7 @@ int stage3(struct xdp_md *ctx)
     if (!dp)
         return XDP_PASS;
 
-    return process_stage(ctx, dp, 3, 75, 25);
+    return process_stage(ctx, dp, 3, 90, 30);
 }
 
 SEC("xdp")
@@ -400,7 +448,7 @@ int stage4(struct xdp_md *ctx)
     if (!dp)
         return XDP_PASS;
 
-    return process_stage(ctx, dp, 4, 100, 25);
+    return process_stage(ctx, dp, 4, 120, 30);
 }
 
 SEC("xdp")
@@ -410,7 +458,7 @@ int stage5(struct xdp_md *ctx)
     if (!dp)
         return XDP_PASS;
 
-    return process_stage(ctx, dp, 5, 125, 25);
+    return process_stage(ctx, dp, 5, 150, 30);
 }
 
 SEC("xdp")
@@ -420,7 +468,7 @@ int stage6(struct xdp_md *ctx)
     if (!dp)
         return XDP_PASS;
 
-    return process_stage(ctx, dp, 6, 150, 25);
+    return process_stage(ctx, dp, 6, 180, 30);
 }
 
 SEC("xdp")
@@ -430,7 +478,7 @@ int stage7(struct xdp_md *ctx)
     if (!dp)
         return XDP_PASS;
 
-    return process_stage(ctx, dp, 7, 175, 25);
+    return process_stage(ctx, dp, 7, 210, 30);
 }
 
 SEC("xdp")
@@ -440,11 +488,21 @@ int stage8(struct xdp_md *ctx)
     if (!dp)
         return XDP_PASS;
 
-    return process_stage(ctx, dp, 8, 200, 25);
+    return process_stage(ctx, dp, 8, 240, 30);
 }
 
 SEC("xdp")
 int stage9(struct xdp_md *ctx)
+{
+    data_point *dp = get_dp_from_ctx(ctx);
+    if (!dp)
+        return XDP_PASS;
+
+    return process_stage(ctx, dp, 9, 270, 30);
+}
+
+SEC("xdp")
+int stage10(struct xdp_md *ctx)
 {
     data_point *dp = get_dp_from_ctx(ctx);
     if (!dp)

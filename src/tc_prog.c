@@ -30,18 +30,14 @@ int tc_dscp_classifier(struct __sk_buff *skb)
     /* Map DSCP to priority (0–7 typical) */
     __u32 prio = 0;
 
-    if (dscp >= 46)              // EF
-        prio = 7;
-    else if (dscp >= 34)         // AF4x
-        prio = 5;
-    else if (dscp >= 26)         // AF3x
-        prio = 4;
-    else if (dscp >= 18)         // AF2x
+    if (dscp == 40)                             // VoIP
         prio = 3;
-    else if (dscp >= 10)         // AF1x
+    else if (dscp == 8 || dscp == 32)           // Streaming, Chat
         prio = 2;
-    else
-        prio = 0;                // Best effort
+    else if (dscp == 0 || dscp == 48)           // Browsing, Mail
+        prio = 1;
+    else                                        // FT, P2P
+        prio = 0;                              
 
     /* Set skb priority */
     skb->priority = prio;

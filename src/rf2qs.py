@@ -184,6 +184,7 @@ def generate_common_header(
     max_depth: int,
     max_features: int,
     num_packets: int,
+    redirect_if : int,
 ):
 
     header = f"""#ifndef COMMON_KERNEL_USER_H
@@ -200,18 +201,21 @@ def generate_common_header(
 #define MAX_DEPTH           {max_depth}
 #define TOTAL_NODES         {max_tree * max_nodes}
 #define NUM_PACKET          {num_packets}
+#define REDIRECT_INTERFACE  {redirect_if}
 #define MAX_FLOW_SAVED      10000
 #define NUM_LABELS          7
+#define NS_TO_SEC_FIXED(x) ((__u32)(((x) << 16) / 1000000000ULL))
 
-#define FEATURE_NB_PACKET   0
-#define FEATURE_MIN_IAT     1
-#define FEATURE_MAX_IAT     2
-#define FEATURE_SUM_IAT     3
-#define FEATURE_MEAN_IAT    4
-#define FEATURE_MIN_LEN     5
-#define FEATURE_MAX_LEN     6
-#define FEATURE_SUM_LEN     7
-#define FEATURE_MEAN_LEN    8
+//current_length,max_length,min_length,sum_length,mean_length,max_iat,min_iat,sum_iat,mean_iat
+#define FEATURE_CUR_PACKET  0
+#define FEATURE_MAX_LEN     1
+#define FEATURE_MIN_LEN     2
+#define FEATURE_SUM_LEN     3
+#define FEATURE_MEAN_LEN    4
+#define FEATURE_MAX_IAT     5
+#define FEATURE_MIN_IAT     6
+#define FEATURE_SUM_IAT     7
+#define FEATURE_MEAN_IAT    8
 
 typedef __u64               fixed;
 
@@ -249,6 +253,7 @@ typedef struct {{
     __u32   sum_len;
     __u32   mean_len;
     fixed   features[MAX_FEATURES];
+    int     classified;
     int     label;
 }} data_point;
 
@@ -446,6 +451,7 @@ def main():
     )
     parser.add_argument("--model", required=True, help="Path to model.pkl")
     parser.add_argument("--iface", required=True, help="Interface to attach prog")
+    parser.add_argument("--rd_if", required=False, default=8, help="Interface to attach prog")
     parser.add_argument("--nb_packet", required=True, help="Add your number of packets")
     parser.add_argument(
         "--output_header",
@@ -456,6 +462,7 @@ def main():
     args = parser.parse_args()
     NUM_PACKET = args.nb_packet
     IFACE = args.iface
+    redirect_if = args.rd_if
     df, max_tree, max_nodes_per_tree, max_depth = dump_random_forest(
         args.model
     )
@@ -477,6 +484,7 @@ def main():
         max_depth,
         max_features,
         NUM_PACKET,
+        redirect_if,
     )
 
     print("\n[MODEL INFO]")

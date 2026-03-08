@@ -7,11 +7,11 @@
 #define FIXED_SHIFT         16
 #define FIXED_SCALE         65536
 #define MAX_TREES           300
-#define MAX_NODE_PER_TREE   2569
+#define MAX_NODE_PER_TREE   2697
 #define MAX_FEATURES        9
 #define MAX_DEPTH           14
-#define TOTAL_NODES         770700
-#define NUM_PACKET          10
+#define TOTAL_NODES         809100
+#define NUM_PACKET          5
 #define REDIRECT_INTERFACE  8
 #define MAX_FLOW_SAVED      10000
 #define NUM_LABELS          7

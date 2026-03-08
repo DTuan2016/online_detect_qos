@@ -83,3 +83,27 @@ target_link_libraries(dump_csv
 )
 
 add_dependencies(xdp_loader bpf_program)
+
+# =========================
+# Build TC BPF program
+# =========================
+
+set(TC_BPF_SRC ${SRC_DIR}/tc_prog.c)
+set(TC_BPF_OBJ ${BUILD_DIR}/tc_prog.o)
+
+add_custom_command(
+    OUTPUT ${TC_BPF_OBJ}
+    COMMAND clang
+        -O2 -g
+        -target bpf
+        -D__TARGET_ARCH_x86
+        -I/usr/include/aarch64-linux-gnu
+        -I${INC_DIR}
+        -I${SRC_DIR}
+        -c ${TC_BPF_SRC}
+        -o ${TC_BPF_OBJ}
+    DEPENDS ${TC_BPF_SRC}
+    COMMENT "Compiling TC BPF program"
+)
+
+add_custom_target(tc_bpf_program ALL DEPENDS ${TC_BPF_OBJ})

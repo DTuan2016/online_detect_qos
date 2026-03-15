@@ -232,7 +232,7 @@ def build_feature_vector(flow, pkt_len):
         mean_len,
         flow["max_iat"],
         flow["min_iat"] or 0,
-        duration,
+        flow["sum_iat"],
         mean_iat,
     ]).reshape(1, -1)
 

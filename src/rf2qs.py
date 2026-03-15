@@ -451,7 +451,7 @@ def main():
     )
     parser.add_argument("--model", required=True, help="Path to model.pkl")
     parser.add_argument("--iface", required=True, help="Interface to attach prog")
-    parser.add_argument("--rd_if", required=False, default=8, help="Interface to attach prog")
+    parser.add_argument("--rd_if", required=False, default=7, help="Interface to attach prog")
     parser.add_argument("--nb_packet", required=True, help="Add your number of packets")
     parser.add_argument(
         "--output_header",

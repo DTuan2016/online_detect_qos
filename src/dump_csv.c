@@ -41,12 +41,21 @@ static void print_flow_csv(FILE *f, const struct flow_key *key, const data_point
     inet_ntop(AF_INET, &saddr, src_ip, sizeof(src_ip));
     inet_ntop(AF_INET, &daddr, dst_ip, sizeof(dst_ip));
 
-    fprintf(f, "%s,%u,%s,%u,%u,%d\n",
+    fprintf(f, "%s,%u,%s,%u,%u,%u,%llu,%llu,%llu,%llu,%u,%u,%u,%u,%d\n",
         src_ip,
         key->src_port,
         dst_ip,
         key->dst_port,
         key->proto,
+	dp->total_pkts,
+	dp->min_iat,
+	dp->max_iat,
+	dp->sum_iat,
+	dp->mean_iat,
+	dp->min_len,
+	dp->max_len,
+	dp->sum_len,
+	dp->mean_len,
         dp->label
     );
 }
@@ -109,7 +118,7 @@ int main(int argc, char **argv) {
     }
 
     /* Header CSV */
-    fprintf(f_flows, "SrcIP,SrcPort,DstIP,DstPort,Proto,Label\n");
+    fprintf(f_flows, "SrcIP,SrcPort,DstIP,DstPort,Proto,TotalPkts,MinIat,MaxIat,SumIat,MeanIat,MinLen,MaxLen,SumLen,MeanLen,Label\n");
 
     dump_flow_map_to_csv(map_fd_flows, f_flows);
 

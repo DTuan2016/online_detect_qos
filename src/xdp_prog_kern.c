@@ -613,7 +613,7 @@ int stage10(struct xdp_md *ctx)
     dp->classified = 1;
     bpf_printk("CLASSIFIED! REWRITE & REDIRECT");
    
-    return bpf_redirect(REDIRECT_INTERFACE, 0);
+    return XDP_PASS;
 }
 
 /* ================= XDP ENTRY ================= */
@@ -649,7 +649,7 @@ int classification(struct xdp_md *ctx)
 
         int best_label = dp->label;
         rewrite_packet(ctx, best_label);
-        return bpf_redirect(REDIRECT_INTERFACE, 0);
+        return XDP_PASS;
     }
     else{
         fv = bpf_map_lookup_elem(&forest_vote_map, &vote_key);

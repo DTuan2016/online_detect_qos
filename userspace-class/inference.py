@@ -4,7 +4,7 @@ import socket
 import time
 import os
 
-from scapy.all import sniff
+from scapy.all import sniff, get_if_hwaddr
 from scapy.layers.inet import IP, TCP, UDP
 
 # =====================
@@ -14,10 +14,10 @@ IN_IFACE  = "eth0"
 OUT_IFACE = "veth-host"
 
 MODEL_PATH = os.path.expanduser(
-    "~/online_detect_qos/classification_model/vpn_10p.pkl"
+    "~/online_detect_qos/classification_model/rf_16p_9f_test.pkl"
 )
 
-MIN_PKTS_FOR_CLASSIFY = 10
+MIN_PKTS_FOR_CLASSIFY = 16
 FLOW_TIMEOUT_NS = 30 * 1e9
 
 DSCP_MAP = {
@@ -103,8 +103,16 @@ def update_flow(pkt):
         return None, None, None
 
     now = time.time_ns()
-    pkt_len = len(pkt)
+    #now = pkt.time
+    #pkt_len = len(pkt)
 
+    if IP in pkt:
+        # ntohs(ip->tot_len) + 14
+        pkt_len = pkt[IP].len + 14 
+    else:
+        # Trường hợp hiếm (không phải IPv4), giữ nguyên len gốc
+        pkt_len = len(pkt)
+    
     if key not in flows:
 
         flows[key] = {
@@ -113,11 +121,11 @@ def update_flow(pkt):
             "total_pkts": 0,
             "total_bytes": 0,
             "min_iat": None,
-            "max_iat": 0,
-            "sum_iat": 0,
+            "max_iat": 0.0,
+            "sum_iat": 0.0,
             "min_len": pkt_len,
             "max_len": pkt_len,
-            "sum_len": 0,
+            "sum_len": 0.0,
             "classified": False,
             "label": None
         }
@@ -126,18 +134,19 @@ def update_flow(pkt):
 
     f = flows[key]
 
-    iat = now - f["last_seen"]
+    iat_ns = now - f["last_seen"]
+    iat_sec = iat_ns/1000000000.0
     f["last_seen"] = now
 
     if f["total_pkts"] > 0:
 
-        if f["min_iat"] is None or iat < f["min_iat"]:
-            f["min_iat"] = iat / 1000000000
+        if f["min_iat"] is None or iat_sec < f["min_iat"]:
+            f["min_iat"] = iat_sec
 
-        if iat > f["max_iat"]:
-            f["max_iat"] = iat / 1000000000
+        if iat_sec > f["max_iat"]:
+            f["max_iat"] = iat_sec
 
-        f["sum_iat"] += iat / 1000000000
+        f["sum_iat"] += iat_sec
 
     if pkt_len < f["min_len"]:
         f["min_len"] = pkt_len
@@ -217,7 +226,7 @@ def build_feature_vector(flow, pkt_len):
     if duration == 0:
         return None
 
-    mean_len = flow["sum_len"] / flow["total_pkts"]
+    mean_len = float(flow["sum_len"] / flow["total_pkts"])
 
     mean_iat = 0
 
@@ -228,7 +237,7 @@ def build_feature_vector(flow, pkt_len):
         pkt_len,
         flow["max_len"],
         flow["min_len"],
-        flow["total_bytes"],
+        flow["sum_len"],
         mean_len,
         flow["max_iat"],
         flow["min_iat"] or 0,
@@ -245,7 +254,7 @@ def build_feature_vector(flow, pkt_len):
 # DSCP REWRITE
 # =====================
 
-def rewrite_dscp(pkt, predicted_class):
+def rewrite_dscp(pkt, predicted_class, flow_key):
 
     if IP not in pkt:
         return pkt
@@ -257,7 +266,9 @@ def rewrite_dscp(pkt, predicted_class):
 
     ip.tos = (dscp << 2) | ecn
 
-    log(f"Set DSCP={dscp} for class={predicted_class}")
+    #log(f"Set DSCP={dscp} for class={predicted_class}")
+    src_ip, dst_ip, proto, sport, dport = flow_key
+    log(f"SET DSCP={dscp} | CLASS={predicted_class} | FLOW: {src_ip}:{sport} -> {dst_ip}:{dport} ({proto})")
 
     del ip.chksum
 
@@ -313,7 +324,7 @@ def process_packet(pkt):
 
         if flow["classified"]:
 
-            pkt = rewrite_dscp(pkt, flow["label"])
+            pkt = rewrite_dscp(pkt, flow["label"], key)
             out_socket.send(bytes(pkt))
             return
 
@@ -333,13 +344,14 @@ def process_packet(pkt):
         debug_tree_path(classifier, features_scaled)
 
         predicted_class = classifier.predict(features_scaled)[0]
+#        debug_full_forest(classifier.model, features, "debug_voip_flow.txt")
 
         log(f"Predicted class: {predicted_class}")
 
         flow["classified"] = True
         flow["label"] = predicted_class
 
-        pkt = rewrite_dscp(pkt, predicted_class)
+        pkt = rewrite_dscp(pkt, predicted_class, key)
 
         out_socket.send(bytes(pkt))
 
@@ -358,6 +370,7 @@ log(f"Listening on {IN_IFACE} → Forwarding to {OUT_IFACE}")
 
 sniff(
     iface=IN_IFACE,
+    filter=f"ether dst {get_if_hwaddr(IN_IFACE)}",
     prn=process_packet,
     store=False
 )

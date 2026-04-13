@@ -202,7 +202,7 @@ def generate_common_header(
 #define TOTAL_NODES         {max_tree * max_nodes}
 #define NUM_PACKET          {num_packets}
 #define REDIRECT_INTERFACE  {redirect_if}
-#define MAX_FLOW_SAVED      10000
+#define MAX_FLOW_SAVED      1000000
 #define NUM_LABELS          7
 #define NS_TO_SEC_FIXED(x) ((__u32)(((x) << 16) / 1000000000ULL))
 

@@ -94,6 +94,9 @@ static __always_inline int parse_packet_get_data(struct xdp_md *ctx,
         if ((void *)(tcph + 1) > data_end) return -1;
         key->src_port = tcph->source;
         key->dst_port = tcph->dest;
+    	if (tcph->source == __constant_htons(53) || tcph->dest == __constant_htons(53)){
+	    return -1;
+	}
     } else if (iph->protocol == IPPROTO_UDP) {
         struct udphdr *udph = (struct udphdr *)((__u8 *)iph + (iph->ihl * 4));
         if ((void *)(udph + 1) > data_end) return -1;
@@ -120,6 +123,9 @@ static __always_inline int debug_traverse_tree(__u32 root_idx, data_point *dp)
         if (node_idx >= (MAX_TREES * MAX_NODE_PER_TREE)) {
             bpf_printk("TREE ERR: node_idx overflow %u", node_idx);
             return -1;
+        }
+
+        Node *node = bpf_map_lookup_elem(&xdp_randforest_nodes, &node_idx);
         }
 
         Node *node = bpf_map_lookup_elem(&xdp_randforest_nodes, &node_idx);
@@ -195,7 +201,7 @@ static __always_inline int predict_one_tree(__u32 root_idx, data_point *dp)
         }
         __u32 f_idx = node->feature_idx;
         if (f_idx >= MAX_FEATURES){
-            return 0;   
+            return 0;
         }
         fixed f_val = dp->features[f_idx];
         fixed split = node->split_value;
@@ -480,7 +486,7 @@ int stage0(struct xdp_md *ctx)
         bpf_printk("GET_DP_FAIL");
         return XDP_PASS;
     }
-        
+
     bpf_printk("GET_DP_SUCCESS");
     return process_stage(ctx, dp, 0, 0, 30);
 }
@@ -509,9 +515,6 @@ SEC("xdp")
 int stage3(struct xdp_md *ctx)
 {
     data_point *dp = get_dp_from_ctx(ctx);
-    if (!dp)
-        return XDP_PASS;
-
     return process_stage(ctx, dp, 3, 90, 30);
 }
 

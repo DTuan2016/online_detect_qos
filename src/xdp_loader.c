@@ -22,7 +22,7 @@ static const char *__doc__ = "XDP loader\n"
 #include "cmd_line.h"
 #include "xdp_loader.h"
 
-static const char *default_filename = "/home/dtuan/online_detect_qos/build/xdp_prog_kern.o";
+static const char *default_filename = "/home/quocanh24/online_detect_qos/build/xdp_prog_kern.o";
 
 static const struct option_wrapper long_options[] = {
 

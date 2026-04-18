@@ -102,6 +102,9 @@ static __always_inline int parse_packet_get_data(struct xdp_md *ctx,
         if ((void *)(udph + 1) > data_end) return -1;
         key->src_port = udph->source;
         key->dst_port = udph->dest;
+	if (udph->source == __constant_htons(53) || udph->dest == __constant_htons(53)){
+	    return -1;
+    }
     } else {
         key->src_port = 0;
         key->dst_port = 0;
@@ -117,15 +120,12 @@ static __always_inline int debug_traverse_tree(__u32 root_idx, data_point *dp)
 {
     __u32 node_idx = root_idx;
 
-#pragma unroll MAX_DEPTH
+    #pragma unroll MAX_DEPTH
     for (int depth = 0; depth < MAX_DEPTH; depth++) {
 
         if (node_idx >= (MAX_TREES * MAX_NODE_PER_TREE)) {
             bpf_printk("TREE ERR: node_idx overflow %u", node_idx);
             return -1;
-        }
-
-        Node *node = bpf_map_lookup_elem(&xdp_randforest_nodes, &node_idx);
         }
 
         Node *node = bpf_map_lookup_elem(&xdp_randforest_nodes, &node_idx);
@@ -515,6 +515,9 @@ SEC("xdp")
 int stage3(struct xdp_md *ctx)
 {
     data_point *dp = get_dp_from_ctx(ctx);
+    if(!dp){
+    	return XDP_PASS;
+    }
     return process_stage(ctx, dp, 3, 90, 30);
 }
 

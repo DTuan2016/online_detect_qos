@@ -117,7 +117,14 @@ def dump_random_forest(model_path: str):
     if not os.path.exists(model_path):
         raise FileNotFoundError(model_path)
 
-    model = joblib.load(model_path)
+    data = joblib.load(model_path)
+    
+    if isinstance(data, dict) and "model" in data:
+        print("[INFO] Detected dict format → extracting model")
+        model = data["model"]
+    else:
+        model = data
+
 
     model = unwrap_model(model)
 
@@ -207,15 +214,12 @@ def generate_common_header(
 #define NS_TO_SEC_FIXED(x) ((__u32)(((x) << 16) / 1000000000ULL))
 
 //current_length,max_length,min_length,sum_length,mean_length,max_iat,min_iat,sum_iat,mean_iat
-#define FEATURE_CUR_PACKET  0
-#define FEATURE_MAX_LEN     1
-#define FEATURE_MIN_LEN     2
+
+#define FEATURE_CUR_LEN     0
+#define FEATURE_MIN_LEN     1
+#define FEATURE_MAX_LEN     2
 #define FEATURE_SUM_LEN     3
 #define FEATURE_MEAN_LEN    4
-#define FEATURE_MAX_IAT     5
-#define FEATURE_MIN_IAT     6
-#define FEATURE_SUM_IAT     7
-#define FEATURE_MEAN_IAT    8
 
 typedef __u64               fixed;
 
@@ -242,11 +246,6 @@ typedef struct {{
     __u64   last_seen;            /* Timestamp of last packet */
     __u32   total_pkts;           /* Total packet count */
     __u32   total_bytes;          /* Total byte count */
-    /*IAT FEATURES*/
-    __u64   min_iat;              /* Minimum Inter-Arrival Time */
-    __u64   max_iat;              /* Minimum Inter-Arrival Time */
-    __u64   sum_iat; 
-    __u64   mean_iat;
     /*PACKET LENGTH FEATURES*/
     __u32   min_len;          /* Maximum packet length */
     __u32   max_len;          /* Minimum packet length */
@@ -467,12 +466,29 @@ def main():
         args.model
     )
 
-    model = joblib.load(args.model)
+    data = joblib.load(args.model)
+
+    if isinstance(data, dict) and "model" in data:
+        print("[INFO] Extracting model from dict...")
+        model = data["model"]
+        feature_names = data.get("features", [])
+    else:
+        model = data
+        feature_names = []
+
     max_features = model.n_features_in_
     classes = list(model.classes_)
     
     print("\n[LABEL INFO]")
     print("Number of labels:", len(classes))
+    
+    print("\n[FEATURE INFO]")
+    print("Number of features:", max_features)
+
+    if feature_names:
+        print("Feature order:")
+        for i, f in enumerate(feature_names):
+            print(f"{i}: {f}")
 
     for i, c in enumerate(classes):
         print(f"Label {i}: {c}")
@@ -494,8 +510,8 @@ def main():
     print("Features:", max_features)
     print("Total nodes:", len(df))
     # Load BPF program
-    BUILD_DIR = "~/online_detect_qos/build"
-    XDP_LOADER_PATH = os.path.expanduser("~/online_detect_qos/build/xdp_loader")
+    BUILD_DIR = "~/qos_paper/online_detect_qos/build"
+    XDP_LOADER_PATH = os.path.expanduser("~/qos_paper/online_detect_qos/build/xdp_loader")
 
     # build
     run("make", cwd=BUILD_DIR)

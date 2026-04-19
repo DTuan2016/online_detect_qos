@@ -336,12 +336,6 @@ update_stats(struct flow_key *key, struct xdp_md *ctx)
         zero.total_pkts   = 1;
         zero.total_bytes  = pkt_len;
 
-        /* IAT init */
-        zero.min_iat  = 0;
-        zero.max_iat  = 0;
-        zero.sum_iat  = 0;
-        zero.mean_iat = 0;
-
         /* Packet length init */
         zero.min_len  = pkt_len;
         zero.max_len  = pkt_len;
@@ -362,28 +356,6 @@ update_stats(struct flow_key *key, struct xdp_md *ctx)
 
         __sync_fetch_and_add(&dp->total_bytes, pkt_len);
 
-        /* ================= IAT ================= */
-
-        __u64 iat_ns = 0;
-        if (ts_ns >= dp->last_seen)
-            iat_ns = ts_ns - dp->last_seen;
-
-        if (iat_ns > 0) {
-
-            if (dp->min_iat == 0 || iat_ns < dp->min_iat)
-                dp->min_iat = iat_ns;
-
-            if (iat_ns > dp->max_iat)
-                dp->max_iat = iat_ns;
-
-            dp->sum_iat += iat_ns;
-
-            __u64 valid_iats = new_total_pkts - 1;
-            if (valid_iats > 0)
-                dp->mean_iat =
-                    (dp->sum_iat << FIXED_SHIFT) / valid_iats;
-        }
-
         /* ================= PACKET LENGTH ================= */
 
         if (pkt_len < dp->min_len)
@@ -403,12 +375,7 @@ update_stats(struct flow_key *key, struct xdp_md *ctx)
 
         /* ================= FEATURE ARRAY ================= */ 
 
-        dp->features[FEATURE_CUR_PACKET] = fixed_from_uint(pkt_len);
-        // dp->features[FEATURE_MIN_IAT]    = NS_TO_SEC_FIXED(dp->min_iat);
-        dp->features[FEATURE_MIN_IAT]    = fixed_div(fixed_from_uint(dp->min_iat), fixed_from_uint(1000000000));
-        dp->features[FEATURE_MAX_IAT]    = fixed_div(fixed_from_uint(dp->max_iat), fixed_from_uint(1000000000));
-        dp->features[FEATURE_SUM_IAT]    = fixed_div(fixed_from_uint(dp->sum_iat), fixed_from_uint(1000000000));
-        dp->features[FEATURE_MEAN_IAT]   = fixed_div(dp->mean_iat, fixed_from_uint(1000000000));
+        dp->features[FEATURE_CUR_LEN] = fixed_from_uint(pkt_len);
         dp->features[FEATURE_MIN_LEN]    = fixed_from_uint(dp->min_len);
         dp->features[FEATURE_MAX_LEN]    = fixed_from_uint(dp->max_len);
         dp->features[FEATURE_SUM_LEN]    = fixed_from_uint(dp->sum_len);

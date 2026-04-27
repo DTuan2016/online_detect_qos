@@ -46,17 +46,6 @@ struct {
     __type(value, __u32);
 } prog_array SEC(".maps");
 
-struct forest_vote {
-    int votes[NUM_LABELS];
-};
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct forest_vote);
-} forest_vote_map SEC(".maps");
-
 /* ================= PACKET PARSING ================= */
 static __always_inline int parse_packet_get_data(struct xdp_md *ctx,
                                                  struct flow_key *key,
@@ -223,35 +212,6 @@ static __always_inline int predict_one_tree(__u32 root_idx, data_point *dp)
     return 0;
 }
 
-/* ================= RANDOM FOREST ================= */
-static __always_inline int predict_forest(data_point *dp)
-{
-    int votes[NUM_LABELS] = {};
-
-    #pragma unroll 25
-    for (__u32 t = 0; t < 25; t++) {
-        __u32 root_key = t * MAX_NODE_PER_TREE;
-        int pred = predict_one_tree(root_key, dp);
-
-        if (pred >= 0 && pred < NUM_LABELS)
-            votes[pred]++;
-    }
-
-    /* Argmax */
-    int best_label = 0;
-    int best_vote = votes[0];
-
-    #pragma unroll
-    for (int i = 1; i < NUM_LABELS; i++) {
-        if (votes[i] > best_vote) {
-            best_vote = votes[i];
-            best_label = i;
-        }
-    }
-
-    return best_label;
-}
-
 static __always_inline void update_ipv4_csum_u8(struct iphdr *iph,
                                                 __u8 old_val,
                                                 __u8 new_val)
@@ -335,6 +295,7 @@ update_stats(struct flow_key *key, struct xdp_md *ctx)
         zero.last_seen    = ts_ns;
         zero.total_pkts   = 1;
         zero.total_bytes  = pkt_len;
+	zero.sum_iat      = 0;
 
         /* Packet length init */
         zero.min_len  = pkt_len;
@@ -355,7 +316,14 @@ update_stats(struct flow_key *key, struct xdp_md *ctx)
         __u64 new_total_pkts = dp->total_pkts;
 
         __sync_fetch_and_add(&dp->total_bytes, pkt_len);
-
+	
+	__u64 iat_ns = 0;
+	if (ts_ns >= dp->last_seen){
+	    iat_ns = ts_ns - dp->last_seen;
+	}
+	if(iat_ns > 0){
+	    dp->sum_iat += iat_ns;
+	}
         /* ================= PACKET LENGTH ================= */
 
         if (pkt_len < dp->min_len)
@@ -368,6 +336,7 @@ update_stats(struct flow_key *key, struct xdp_md *ctx)
 
         dp->mean_len =
             (dp->sum_len << FIXED_SHIFT) / new_total_pkts;
+	//dp->sum_iat = dp->sum_iat/
 
         /* ================= UPDATE TIME ================= */
 
@@ -375,7 +344,8 @@ update_stats(struct flow_key *key, struct xdp_md *ctx)
 
         /* ================= FEATURE ARRAY ================= */ 
 
-        dp->features[FEATURE_CUR_LEN] = fixed_from_uint(pkt_len);
+        dp->features[FEATURE_CUR_LEN]    = fixed_from_uint(pkt_len);
+	dp->features[FEATURE_SUM_IAT]    = (dp->sum_iat << FIXED_SHIFT)/1000000000;
         dp->features[FEATURE_MIN_LEN]    = fixed_from_uint(dp->min_len);
         dp->features[FEATURE_MAX_LEN]    = fixed_from_uint(dp->max_len);
         dp->features[FEATURE_SUM_LEN]    = fixed_from_uint(dp->sum_len);
@@ -383,7 +353,7 @@ update_stats(struct flow_key *key, struct xdp_md *ctx)
 
         /* ================= DETECTION ================= */
 
-        if (new_total_pkts == NUM_PACKET)
+        if (new_total_pkts <= NUM_PACKET)
         {
             status = 1;
         }
@@ -401,11 +371,6 @@ static __always_inline int process_stage(struct xdp_md *ctx,
                                          __u32 tree_count)
 {
     __u32 key = 0;
-    struct forest_vote *fv =
-        bpf_map_lookup_elem(&forest_vote_map, &key);
-
-    if (!fv)
-        return XDP_PASS;
 
 #pragma unroll
     for (int t = 0; t < 30; t++) {
@@ -416,7 +381,7 @@ static __always_inline int process_stage(struct xdp_md *ctx,
         // int pred = predict_one_tree(root, dp);
         int pred = debug_traverse_tree(root, dp);
         if (pred >= 0 && pred < NUM_LABELS)
-            fv->votes[pred]++;
+            dp->votes[pred]++;
     }
 
     /* tail call next stage */
@@ -555,29 +520,17 @@ int stage10(struct xdp_md *ctx)
     if (!dp)
         return XDP_PASS;
 
-    __u32 key = 0;
-    struct forest_vote *fv =
-        bpf_map_lookup_elem(&forest_vote_map, &key);
-
-    if (!fv)
-        return XDP_PASS;
-
     /* Argmax */
     int best_label = 0;
-    int best_vote = fv->votes[0];
+    int best_vote = dp->votes[0];
 
-#pragma unroll
+    #pragma unroll
     for (int i = 1; i < NUM_LABELS; i++) {
-        if (fv->votes[i] > best_vote) {
-            best_vote = fv->votes[i];
+        if (dp->votes[i] > best_vote) {
+            best_vote = dp->votes[i];
             best_label = i;
         }
     }
-
-    /* reset votes */
-#pragma unroll
-    for (int i = 0; i < NUM_LABELS; i++)
-        fv->votes[i] = 0;
 
     rewrite_packet(ctx, best_label);
 
@@ -596,9 +549,6 @@ int classification(struct xdp_md *ctx)
     bpf_printk("START CLASSIFICATION");
     struct flow_key key = {};
     __u64 pkt_len = 0;
-    __u32 vote_key = 0;
-
-    struct forest_vote *fv;
     int ret = parse_packet_get_data(ctx, &key, &pkt_len);
     bpf_printk("DONE PARSE PACKET");
 
@@ -625,13 +575,13 @@ int classification(struct xdp_md *ctx)
         return XDP_PASS;
     }
     else{
-        fv = bpf_map_lookup_elem(&forest_vote_map, &vote_key);
-        if (!fv)
+        data_point *dp = bpf_map_lookup_elem(&xdp_flow_tracking, &key);
+        if (!dp)
             return XDP_PASS;
 
-    #pragma unroll
+        #pragma unroll
         for (int i = 0; i < NUM_LABELS; i++)
-            fv->votes[i] = 0;
+            dp->votes[i] = 0;
 
         bpf_printk("JUMP_TO_STAGE_0");
         bpf_tail_call(ctx, &prog_array, 0);

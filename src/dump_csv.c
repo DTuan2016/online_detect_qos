@@ -10,28 +10,13 @@
 
 #include "common_kern_user.h"
 
-int open_bpf_map_file(const char *pin_dir,
-                      const char *mapname,
-                      struct bpf_map_info *info);
-
 const char *pin_basedir = "/sys/fs/bpf";
+
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
 
 /* ================= CSV PRINT ================= */
-// static void print_node_csv(FILE *f, __u32 key, const Node *node) {
-//     fprintf(f, "%u,%d,%d,%d,%d,%lld,%d,%d,%d\n",
-//             key,
-//             node->tree_idx,
-//             node->left_idx,
-//             node->right_idx,
-//             node->feature_idx,
-//             node->split_value,
-//             node->is_leaf,
-//             node->label,
-//             0);
-// }
 
 static void print_flow_csv(FILE *f, const struct flow_key *key, const data_point *dp) {
     char src_ip[INET_ADDRSTRLEN], dst_ip[INET_ADDRSTRLEN];
@@ -41,45 +26,40 @@ static void print_flow_csv(FILE *f, const struct flow_key *key, const data_point
     inet_ntop(AF_INET, &saddr, src_ip, sizeof(src_ip));
     inet_ntop(AF_INET, &daddr, dst_ip, sizeof(dst_ip));
 
-    fprintf(f, "%s,%u,%s,%u,%u,%u,%llu,%llu,%llu,%llu,%llu,%u,%u,%u,%u,%d\n",
-        src_ip,
-        key->src_port,
-        dst_ip,
-        key->dst_port,
+    fprintf(f, "%s,%u,%s,%u,%u,%llu,%llu,%u,%u,%u,%u,%llu,%d\n",
+        src_ip, key->src_port,
+        dst_ip, key->dst_port,
         key->proto,
-	dp->features[0],
-	dp->total_pkts,
-	dp->min_iat,
-	dp->max_iat,
-	dp->sum_iat,
-	dp->mean_iat,
-	dp->min_len,
-	dp->max_len,
-	dp->sum_len,
-	dp->mean_len,
+        (unsigned long long)dp->features[0],
+	(unsigned long long)dp->sum_iat,
+        dp->total_pkts,
+        dp->min_len,
+        dp->max_len,
+        dp->sum_len,
+        (unsigned long long)dp->mean_len,
         dp->label
     );
 }
 
-/* ================= DUMP MAPS ================= */
-// static void dump_nodes_to_csv(int map_fd, FILE *f) {
-//     __u32 key = 0, next_key;
-//     Node node;
+static void print_node_csv(FILE *f, __u32 key, const Node *node) {
+    fprintf(f, "%u,%u,%d,%d,%u,%lld,%u,%d\n",
+        key,                    // global index
+        node->tree_idx,         // tree index
+        node->left_idx,
+        node->right_idx,
+        node->feature_idx,
+        (long long)node->split_value,
+        node->is_leaf,
+        node->label
+    );
+}
 
-//     while (bpf_map_get_next_key(map_fd, &key, &next_key) == 0) {
-//         if (bpf_map_lookup_elem(map_fd, &next_key, &node) == 0) {
-//             print_node_csv(f, next_key, &node);
-//         }
-//         key = next_key;
-//     }
-//     fflush(f);
-// }
+/* ================= DUMP FUNCTIONS ================= */
 
 static void dump_flow_map_to_csv(int map_fd, FILE *f) {
-    struct flow_key key, next_key;
+    struct flow_key key = {}, next_key;
     data_point dp;
 
-    memset(&key, 0, sizeof(key));
     while (bpf_map_get_next_key(map_fd, &key, &next_key) == 0) {
         if (bpf_map_lookup_elem(map_fd, &next_key, &dp) == 0) {
             print_flow_csv(f, &next_key, &dp);
@@ -89,43 +69,84 @@ static void dump_flow_map_to_csv(int map_fd, FILE *f) {
     fflush(f);
 }
 
+static void dump_node_map_to_csv(int map_fd, FILE *f) {
+    __u32 key = 0, next_key;
+    Node node;
+
+    while (bpf_map_get_next_key(map_fd, &key, &next_key) == 0) {
+        if (bpf_map_lookup_elem(map_fd, &next_key, &node) == 0) {
+            print_node_csv(f, next_key, &node);
+        }
+        key = next_key;
+    }
+    fflush(f);
+}
+
 /* ================= MAIN ================= */
+
 int main(int argc, char **argv) {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <ifname> <flows_out.csv>\n", argv[0]);
+    if (argc < 4) {
+        fprintf(stderr, "Usage: %s <ifname> <flows.csv> <nodes.csv>\n", argv[0]);
         return EXIT_FAILURE;
     }
 
     const char *ifname = argv[1];
     const char *flows_filename = argv[2];
+    const char *nodes_filename = argv[3];
 
-    struct bpf_map_info info = {0};
     char pin_dir[PATH_MAX];
     snprintf(pin_dir, PATH_MAX, "%s/%s", pin_basedir, ifname);
 
-    char map_path[PATH_MAX];
-    snprintf(map_path, PATH_MAX, "%s/%s", pin_dir, "xdp_flow_tracking");
+    /* ================= OPEN FLOW MAP ================= */
+    char flow_map_path[PATH_MAX];
+    snprintf(flow_map_path, PATH_MAX, "%s/%s", pin_dir, "xdp_flow_tracking");
 
-    int map_fd_flows = bpf_obj_get(map_path);
-    if (map_fd_flows < 0) {
-        perror("bpf_obj_get");
-        fprintf(stderr, "ERR: cannot open map %s\n", map_path);
+    int flow_fd = bpf_obj_get(flow_map_path);
+    if (flow_fd < 0) {
+        perror("bpf_obj_get flow");
         return EXIT_FAILURE;
     }
+
+    /* ================= OPEN NODE MAP ================= */
+    char node_map_path[PATH_MAX];
+    snprintf(node_map_path, PATH_MAX, "%s/%s", pin_dir, "xdp_randforest_nodes");
+
+    int node_fd = bpf_obj_get(node_map_path);
+    if (node_fd < 0) {
+        perror("bpf_obj_get nodes");
+        return EXIT_FAILURE;
+    }
+
+    /* ================= OPEN FILES ================= */
     FILE *f_flows = fopen(flows_filename, "w");
     if (!f_flows) {
-        perror("fopen");
+        perror("fopen flows");
         return EXIT_FAILURE;
     }
 
-    /* Header CSV */
-    fprintf(f_flows, "SrcIP,SrcPort,DstIP,DstPort,Proto,CurrenLength,TotalPkts,MinIat,MaxIat,SumIat,MeanIat,MinLen,MaxLen,SumLen,MeanLen,Label\n");
+    FILE *f_nodes = fopen(nodes_filename, "w");
+    if (!f_nodes) {
+        perror("fopen nodes");
+        return EXIT_FAILURE;
+    }
 
-    dump_flow_map_to_csv(map_fd_flows, f_flows);
+    /* ================= HEADERS ================= */
+    fprintf(f_flows,
+        "SrcIP,SrcPort,DstIP,DstPort,Proto,CurrentLength,SumIat,TotalPkts,MinLen,MaxLen,SumLen,MeanLen,Label\n");
+
+    fprintf(f_nodes,
+        "NodeIdx,TreeIdx,Left,Right,FeatureIdx,SplitValue,IsLeaf,Label\n");
+
+    /* ================= DUMP ================= */
+    dump_flow_map_to_csv(flow_fd, f_flows);
+    dump_node_map_to_csv(node_fd, f_nodes);
 
     fclose(f_flows);
+    fclose(f_nodes);
 
-    printf("Dumped xdp_flow_tracking -> %s\n", flows_filename);
+    printf("Dumped:\n");
+    printf("  Flows -> %s\n", flows_filename);
+    printf("  Nodes -> %s\n", nodes_filename);
 
     return EXIT_SUCCESS;
 }

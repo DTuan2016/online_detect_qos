@@ -6,7 +6,6 @@ import pandas as pd
 from math import log2
 from bcc import BPF
 import ctypes
-import joblib
 import subprocess
 import sys
 from bcc import libbcc
@@ -22,9 +21,7 @@ class Node(ctypes.Structure):
         ("tree_idx", ctypes.c_int),
     ]
 
-
 def load_nodes_to_map(df: pd.DataFrame, MAP_PATH: str):
-
     map_fd = libbcc.lib.bpf_obj_get(MAP_PATH.encode())
     if map_fd < 0:
         raise OSError(f"Failed to open pinned map at {MAP_PATH}")
@@ -32,11 +29,11 @@ def load_nodes_to_map(df: pd.DataFrame, MAP_PATH: str):
     print(f"[LOAD] Opened pinned map: {MAP_PATH}")
     print(f"[LOAD] Total nodes: {len(df)}")
 
-    df = df.reset_index(drop=True)
-
-    for global_idx, row in df.iterrows():
-
-        key = global_idx.to_bytes(4, "little", signed=False)
+    # Khong can reset_index(drop=True) nua vi ta dung map_key truc tiep
+    
+    for _, row in df.iterrows():
+        # FIX: Su dung map_key da duoc can chinh de lam key cho BPF Map
+        key = int(row["map_key"]).to_bytes(4, "little", signed=False)
 
         val = (
             int(row["left_idx"]).to_bytes(4, "little", signed=True) +
@@ -50,9 +47,10 @@ def load_nodes_to_map(df: pd.DataFrame, MAP_PATH: str):
 
         ret = libbcc.lib.bpf_update_elem(map_fd, key, val, 0)
         if ret != 0:
-            print(f"[LOAD] Failed at index {global_idx}")
+            print(f"[LOAD] Failed at index {row['map_key']}")
 
     print("[LOAD] All nodes inserted successfully.")
+
 
 SCALE_BITS = 16
 SCALE = 1 << SCALE_BITS
@@ -86,7 +84,6 @@ def float_to_fixed_u64(value: float, scale_bits: int = SCALE_BITS) -> int:
     scaled = int(value * (1 << scale_bits))
     return max(scaled, 0)
 
-
 # ============================================================
 # READ MODEL + EXTRACT META
 # ============================================================
@@ -96,7 +93,6 @@ def extract_model_info(model):
         raise ValueError("Model chưa fit hoặc không phải RandomForestClassifier.")
 
     max_tree = len(model.estimators_)
-
     max_nodes_per_tree = 0
     max_depth = 0
 
@@ -113,7 +109,6 @@ def extract_model_info(model):
 # ============================================================
 
 def dump_random_forest(model_path: str):
-
     if not os.path.exists(model_path):
         raise FileNotFoundError(model_path)
 
@@ -124,7 +119,6 @@ def dump_random_forest(model_path: str):
         model = data["model"]
     else:
         model = data
-
 
     model = unwrap_model(model)
 
@@ -137,18 +131,21 @@ def dump_random_forest(model_path: str):
     classes = list(model.classes_)
     label_map = {c: i for i, c in enumerate(classes)}
 
-    global_offset = 0
+    # FIX: Loai bo viec khoi tao global_offset = 0 o day
 
     for tree_idx, estimator in enumerate(model.estimators_):
         tree = estimator.tree_
         node_count = tree.node_count
+
+        # FIX: Tinh offset co dinh cho moi cay, dam bao khop 100% voi C code
+        global_offset = tree_idx * max_nodes_per_tree
 
         for node_idx in range(node_count):
             left = tree.children_left[node_idx]
             right = tree.children_right[node_idx]
             is_leaf = int(left == -1 and right == -1)
 
-            # Convert local index → global index
+            # Convert local index → global map index
             if left != -1:
                 left += global_offset
             if right != -1:
@@ -162,6 +159,7 @@ def dump_random_forest(model_path: str):
                     label = label_map[label_name]
 
             rows.append({
+                "map_key": global_offset + node_idx, # FIX: Them key ro rang de dua vao bpf map
                 "tree_idx": tree_idx,
                 "feature_idx": int(tree.feature[node_idx]),
                 "split_value": float_to_fixed_u64(
@@ -173,7 +171,7 @@ def dump_random_forest(model_path: str):
                 "label": label,
             })
 
-        global_offset += node_count
+        # FIX: Loai bo global_offset += node_count o day de tranh cac cay bi ep sat vao nhau
 
     df = pd.DataFrame(rows)
 
@@ -216,10 +214,11 @@ def generate_common_header(
 //current_length,max_length,min_length,sum_length,mean_length,max_iat,min_iat,sum_iat,mean_iat
 
 #define FEATURE_CUR_LEN     0
-#define FEATURE_MIN_LEN     1
-#define FEATURE_MAX_LEN     2
-#define FEATURE_SUM_LEN     3
-#define FEATURE_MEAN_LEN    4
+#define FEATURE_SUM_IAT     1
+#define FEATURE_MIN_LEN     2
+#define FEATURE_MAX_LEN     3
+#define FEATURE_SUM_LEN     4
+#define FEATURE_MEAN_LEN    5
 
 typedef __u64               fixed;
 
@@ -246,15 +245,17 @@ typedef struct {{
     __u64   last_seen;            /* Timestamp of last packet */
     __u32   total_pkts;           /* Total packet count */
     __u32   total_bytes;          /* Total byte count */
+    __u64   sum_iat;
     /*PACKET LENGTH FEATURES*/
     __u32   min_len;          /* Maximum packet length */
     __u32   max_len;          /* Minimum packet length */
-    __u32   sum_len;
-    __u32   mean_len;
+    __u64   sum_len;
+    fixed   mean_len;
     fixed   features[MAX_FEATURES];
+    int     votes[NUM_LABELS];
     int     classified;
     int     label;
-}} data_point;
+}} __attribute__((packed)) data_point;
 
 // /* Definition of feature vector to calculate RF */
 // struct feat_vec {{
@@ -510,8 +511,8 @@ def main():
     print("Features:", max_features)
     print("Total nodes:", len(df))
     # Load BPF program
-    BUILD_DIR = "~/qos_paper/online_detect_qos/build"
-    XDP_LOADER_PATH = os.path.expanduser("~/qos_paper/online_detect_qos/build/xdp_loader")
+    BUILD_DIR = "~/online_detect_qos/build"
+    XDP_LOADER_PATH = os.path.expanduser("~/online_detect_qos/build/xdp_loader")
 
     # build
     run("make", cwd=BUILD_DIR)

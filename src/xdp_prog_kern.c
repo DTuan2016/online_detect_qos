@@ -195,7 +195,7 @@ int classification(struct xdp_md *ctx){
     
     int status = update_stats(&key, ctx, ac);
     __u64 done_ts = bpf_ktime_get_ns();
-    ac->proc_time = done_ts - ac->time_in;
+    ac->proc_time += done_ts - ac->time_in;
     ac->total_bytes += pkt_len;
     ac->total_pkts += 1;
     bpf_redirect(REDIRECT_INTERFACE, 0);

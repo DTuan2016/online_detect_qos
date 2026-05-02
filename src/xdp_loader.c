@@ -109,87 +109,76 @@ load_bpf_and_xdp_attach(struct config *cfg)
 
     printf("✔ Attached classification to %s\n", cfg->ifname);
 
-    int map_fd = bpf_object__find_map_fd_by_name(obj, "prog_array");
-    if (map_fd < 0) {
-        fprintf(stderr, "ERR: cannot find prog_array map\n");
-        return NULL;
-    }
+    // int map_fd = bpf_object__find_map_fd_by_name(obj, "prog_array");
+    // if (map_fd < 0) {
+    //     fprintf(stderr, "ERR: cannot find prog_array map\n");
+    //     return NULL;
+    // }
 
-    for (int i = 0; i <= 10; i++) {
-        char name[32];
-        snprintf(name, sizeof(name), "stage%d", i);
+    // for (int i = 0; i <= 10; i++) {
+    //     char name[32];
+    //     snprintf(name, sizeof(name), "stage%d", i);
 
-        struct bpf_program *stage =
-            bpf_object__find_program_by_name(obj, name);
+    //     struct bpf_program *stage =
+    //         bpf_object__find_program_by_name(obj, name);
 
-        if (!stage) {
-            fprintf(stderr, "ERR: cannot find %s\n", name);
-            return NULL;
-        }
+    //     if (!stage) {
+    //         fprintf(stderr, "ERR: cannot find %s\n", name);
+    //         return NULL;
+    //     }
 
-        int fd = bpf_program__fd(stage);
-        if (fd < 0) {
-            fprintf(stderr, "ERR: fd of %s invalid\n", name);
-            return NULL;
-        }
+    //     int fd = bpf_program__fd(stage);
+    //     if (fd < 0) {
+    //         fprintf(stderr, "ERR: fd of %s invalid\n", name);
+    //         return NULL;
+    //     }
 
-        __u32 key = i;
-        err = bpf_map_update_elem(map_fd, &key, &fd, 0);
-        if (err) {
-            fprintf(stderr,
-                "ERR: updating prog_array[%d]\n", i);
-            return NULL;
-        }
+    //     __u32 key = i;
+    //     err = bpf_map_update_elem(map_fd, &key, &fd, 0);
+    //     if (err) {
+    //         fprintf(stderr,
+    //             "ERR: updating prog_array[%d]\n", i);
+    //         return NULL;
+    //     }
 
-        printf("[S] prog_array[%d] = %s\n", i, name);
-    }
+    //     printf("[S] prog_array[%d] = %s\n", i, name);
+    // }
 
-    printf("[S] Tail-call map initialized\n");
+    // printf("[S] Tail-call map initialized\n");
 
     return obj;
 }
 
-int pin_maps_in_bpf_object(struct bpf_object *bpf_obj, const char *subdir){
-    char map_filename[PATH_MAX];
-	char pin_dir[PATH_MAX];
-	int err, len;
+int pin_maps_in_bpf_object(struct bpf_object *obj, const char *subdir)
+{
+    char pin_dir[PATH_MAX];
+    int err;
 
-    memset(pin_dir, 0, sizeof(pin_dir));
-	len = snprintf(pin_dir, PATH_MAX, "%s/%s", pin_basedir, subdir);
-	if (len < 0) {
-		fprintf(stderr, "ERR: creating pin dirname\n");
-		return EXIT_FAIL_OPTION;
-	}
+    int len = snprintf(pin_dir, sizeof(pin_dir),
+                       "%s/%s", pin_basedir, subdir);
 
-	len = snprintf(map_filename, PATH_MAX, "%s/%s/%s",
-		       pin_basedir, subdir, map_name);
-	if (len < 0) {
-		fprintf(stderr, "ERR: creating map_name\n");
-		return EXIT_FAIL_OPTION;
-	}
+    if (len < 0 || len >= sizeof(pin_dir)) {
+        fprintf(stderr, "ERR: pin_dir too long\n");
+        return EXIT_FAIL_OPTION;
+    }
 
-	/* Existing/previous XDP prog might not have cleaned up */
-	if (access(map_filename, F_OK ) != -1 ) {
-		if (verbose)
-			printf(" - Unpinning (remove) prev maps in %s/\n",
-			       pin_dir);
+    if (access(pin_dir, F_OK) != 0) {
+        if (mkdir(pin_dir, 0755) && errno != EEXIST) {
+            perror("mkdir");
+            return EXIT_FAIL_OPTION;
+        }
+    }
 
-		/* Basically calls unlink(3) on map_filename */
-		err = bpf_object__unpin_maps(bpf_obj, pin_dir);
-		if (err) {
-			fprintf(stderr, "ERR: UNpinning maps in %s\n", pin_dir);
-			return EXIT_FAIL_BPF;
-		}
-	}
-	if (verbose)
-		printf(" - Pinning maps in %s/\n", pin_dir);
+    if (verbose)
+        printf(" - Pinning ALL maps in %s/\n", pin_dir);
 
-	/* This will pin all maps in our bpf_object */
-	err = bpf_object__pin_maps(bpf_obj, pin_dir);
-	if (err)
-		return EXIT_FAIL_BPF;
+    err = bpf_object__pin_maps(obj, pin_dir);
+    if (err) {
+        fprintf(stderr, "ERR: pinning maps\n");
+        return EXIT_FAIL_BPF;
+    }
 
-	return 0;
+    return 0;
 }
 
 int remove_pin_dir(const char *path)

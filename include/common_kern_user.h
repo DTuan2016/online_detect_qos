@@ -62,7 +62,7 @@ typedef struct {
     int     votes[NUM_LABELS];
     int     classified;
     int     label;
-} data_point;
+} __attribute__((packed)) data_point;
 
 // /* Definition of feature vector to calculate RF */
 // struct feat_vec {

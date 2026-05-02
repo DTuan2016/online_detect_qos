@@ -26,7 +26,7 @@ static void print_flow_csv(FILE *f, const struct flow_key *key, const data_point
     inet_ntop(AF_INET, &saddr, src_ip, sizeof(src_ip));
     inet_ntop(AF_INET, &daddr, dst_ip, sizeof(dst_ip));
 
-    fprintf(f, "%s,%u,%s,%u,%u,%llu,%llu,%u,%u,%u,%u,%llu,%d\n",
+    fprintf(f, "%s,%u,%s,%u,%u,%llu,%llu,%u,%u,%u,%llu,%llu,%d\n",
         src_ip, key->src_port,
         dst_ip, key->dst_port,
         key->proto,

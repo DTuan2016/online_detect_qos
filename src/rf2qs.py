@@ -228,6 +228,7 @@ typedef struct {{
     __u64 proc_time;  /*proc_time += time_out - time_in*/
     __u64 total_pkts;
     __u64 total_bytes;
+    __u64 flow_created;
 }} accounting;
 
 /* Flow key structure */

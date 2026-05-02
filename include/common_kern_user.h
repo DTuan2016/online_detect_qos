@@ -7,10 +7,10 @@
 #define FIXED_SHIFT         16
 #define FIXED_SCALE         65536
 #define MAX_TREES           300
-#define MAX_NODE_PER_TREE   1195
-#define MAX_FEATURES        6
-#define MAX_DEPTH           35
-#define TOTAL_NODES         358500
+#define MAX_NODE_PER_TREE   2697
+#define MAX_FEATURES        9
+#define MAX_DEPTH           14
+#define TOTAL_NODES         809100
 #define NUM_PACKET          12
 #define REDIRECT_INTERFACE  6
 #define MAX_FLOW_SAVED      1000000
@@ -34,6 +34,7 @@ typedef struct {
     __u64 proc_time;  /*proc_time += time_out - time_in*/
     __u64 total_pkts;
     __u64 total_bytes;
+    __u64 flow_created;
 } accounting;
 
 /* Flow key structure */
@@ -61,7 +62,7 @@ typedef struct {
     int     votes[NUM_LABELS];
     int     classified;
     int     label;
-} __attribute__((packed)) data_point;
+} data_point;
 
 // /* Definition of feature vector to calculate RF */
 // struct feat_vec {

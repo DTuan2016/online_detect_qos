@@ -113,26 +113,26 @@ static __always_inline int debug_traverse_tree(__u32 root_idx, data_point *dp)
     for (int depth = 0; depth < MAX_DEPTH; depth++) {
 
         if (node_idx >= (MAX_TREES * MAX_NODE_PER_TREE)) {
-            bpf_printk("TREE ERR: node_idx overflow %u", node_idx);
+            // bpf_printk("TREE ERR: node_idx overflow %u", node_idx);
             return -1;
         }
 
         Node *node = bpf_map_lookup_elem(&xdp_randforest_nodes, &node_idx);
         if (!node) {
-            bpf_printk("TREE ERR: node NULL idx=%u", node_idx);
+            // bpf_printk("TREE ERR: node NULL idx=%u", node_idx);
             return -1;
         }
 
         /* Leaf node */
         if (node->is_leaf) {
-            bpf_printk("TREE LEAF depth=%d idx=%u label=%d",
-                       depth, node_idx, node->label);
+            // bpf_printk("TREE LEAF depth=%d idx=%u label=%d",
+                    //    depth, node_idx, node->label);
             return node->label;
         }
 
         __u32 f_idx = node->feature_idx;
         if (f_idx >= MAX_FEATURES) {
-            bpf_printk("TREE ERR: feature_idx overflow %u", f_idx);
+            // bpf_printk("TREE ERR: feature_idx overflow %u", f_idx);
             return -1;
         }
 
@@ -145,27 +145,27 @@ static __always_inline int debug_traverse_tree(__u32 root_idx, data_point *dp)
 
         if (f_val <= split) {
             next_idx = node->left_idx;
-            bpf_printk(
-                "NODE depth=%d idx=%u f=%u val=%d split=%d -> LEFT %u",
-                depth, node_idx, f_idx, f_val, split, next_idx);
+            // bpf_printk(
+            //     "NODE depth=%d idx=%u f=%u val=%d split=%d -> LEFT %u",
+            //     depth, node_idx, f_idx, f_val, split, next_idx);
         } else {
             next_idx = node->right_idx;
-            bpf_printk(
-                "NODE depth=%d idx=%u f=%u val=%d split=%d -> RIGHT %u",
-                depth, node_idx, f_idx, f_val, split, next_idx);
+        //     bpf_printk(
+        //         "NODE depth=%d idx=%u f=%u val=%d split=%d -> RIGHT %u",
+        //         depth, node_idx, f_idx, f_val, split, next_idx);
         }
 
         if (next_idx == (__u32)-1 ||
             next_idx >= (MAX_TREES * MAX_NODE_PER_TREE)) {
 
-            bpf_printk("TREE ERR: invalid next_idx=%u", next_idx);
+            // bpf_printk("TREE ERR: invalid next_idx=%u", next_idx);
             return -1;
         }
 
         node_idx = next_idx;
     }
 
-    bpf_printk("TREE WARN: reached MAX_DEPTH root=%u", root_idx);
+    // bpf_printk("TREE WARN: reached MAX_DEPTH root=%u", root_idx);
     return -1;
 }
 
@@ -279,7 +279,7 @@ static __always_inline int rewrite_packet(struct xdp_md *ctx, __u8 label)
 
 /* ================= FLOW STATS ================= */
 static __always_inline int
-update_stats(struct flow_key *key, struct xdp_md *ctx)
+update_stats(struct flow_key *key, struct xdp_md *ctx, accounting *ac)
 {
     __u64 ts_ns = bpf_ktime_get_ns();
     __u64 pkt_len = (__u64)((__u8 *)(long)ctx->data_end -
@@ -295,7 +295,7 @@ update_stats(struct flow_key *key, struct xdp_md *ctx)
         zero.last_seen    = ts_ns;
         zero.total_pkts   = 1;
         zero.total_bytes  = pkt_len;
-	zero.sum_iat      = 0;
+	    zero.sum_iat      = 0;
 
         /* Packet length init */
         zero.min_len  = pkt_len;
@@ -305,7 +305,10 @@ update_stats(struct flow_key *key, struct xdp_md *ctx)
         zero.label      = -1;
         zero.classified = 0;
 
-        bpf_map_update_elem(&xdp_flow_tracking, key, &zero, BPF_ANY);
+        int ret = bpf_map_update_elem(&xdp_flow_tracking, key, &zero, BPF_ANY);
+        if (ret == 0) {
+            __sync_fetch_and_add(&ac->flow_created, 1);
+        }
         return XDP_PASS;
     }
     else{
@@ -317,13 +320,13 @@ update_stats(struct flow_key *key, struct xdp_md *ctx)
 
         __sync_fetch_and_add(&dp->total_bytes, pkt_len);
 	
-	__u64 iat_ns = 0;
-	if (ts_ns >= dp->last_seen){
-	    iat_ns = ts_ns - dp->last_seen;
-	}
-	if(iat_ns > 0){
-	    dp->sum_iat += iat_ns;
-	}
+	    __u64 iat_ns = 0;
+        if (ts_ns >= dp->last_seen){
+            iat_ns = ts_ns - dp->last_seen;
+        }
+        if(iat_ns > 0){
+            dp->sum_iat += iat_ns;
+        }
         /* ================= PACKET LENGTH ================= */
 
         if (pkt_len < dp->min_len)
@@ -333,26 +336,17 @@ update_stats(struct flow_key *key, struct xdp_md *ctx)
             dp->max_len = pkt_len;
 
         dp->sum_len += pkt_len;
-
-        dp->mean_len =
-            (dp->sum_len << FIXED_SHIFT) / new_total_pkts;
-	//dp->sum_iat = dp->sum_iat/
-
+        dp->mean_len = (dp->sum_len << FIXED_SHIFT) / new_total_pkts;
         /* ================= UPDATE TIME ================= */
-
         dp->last_seen = ts_ns;
-
         /* ================= FEATURE ARRAY ================= */ 
-
         dp->features[FEATURE_CUR_LEN]    = fixed_from_uint(pkt_len);
-	dp->features[FEATURE_SUM_IAT]    = (dp->sum_iat << FIXED_SHIFT)/1000000000;
+	    dp->features[FEATURE_SUM_IAT]    = (dp->sum_iat << FIXED_SHIFT)/1000000000;
         dp->features[FEATURE_MIN_LEN]    = fixed_from_uint(dp->min_len);
         dp->features[FEATURE_MAX_LEN]    = fixed_from_uint(dp->max_len);
         dp->features[FEATURE_SUM_LEN]    = fixed_from_uint(dp->sum_len);
         dp->features[FEATURE_MEAN_LEN]   = dp->mean_len;
-
         /* ================= DETECTION ================= */
-
         if (new_total_pkts <= NUM_PACKET)
         {
             status = 1;
@@ -386,7 +380,7 @@ static __always_inline int process_stage(struct xdp_md *ctx,
 
     /* tail call next stage */
     __u32 next = stage_id + 1;
-    bpf_printk("JUMP_TO_STAGE_%d", next);
+    // bpf_printk("JUMP_TO_STAGE_%d", next);
     bpf_tail_call(ctx, &prog_array, next);
 
     /* nếu tail call fail */
@@ -411,15 +405,15 @@ static __always_inline data_point *get_dp_from_ctx(struct xdp_md *ctx)
 SEC("xdp")
 int stage0(struct xdp_md *ctx)
 {
-    bpf_printk("HERE_IS_STAGE_0");
+    // bpf_printk("HERE_IS_STAGE_0");
     data_point *dp = get_dp_from_ctx(ctx);
     if (!dp)
     {
-        bpf_printk("GET_DP_FAIL");
+        // bpf_printk("GET_DP_FAIL");
         return XDP_PASS;
     }
 
-    bpf_printk("GET_DP_SUCCESS");
+    // bpf_printk("GET_DP_SUCCESS");
     return process_stage(ctx, dp, 0, 0, 30);
 }
 
@@ -517,8 +511,16 @@ SEC("xdp")
 int stage10(struct xdp_md *ctx)
 {
     data_point *dp = get_dp_from_ctx(ctx);
-    if (!dp)
+
+    __u64 key_ac = 0;
+    accounting *ac = bpf_map_lookup_elem(&accounting_map, &key_ac);
+
+    if(!ac){
         return XDP_PASS;
+    }
+    if (!dp){
+        return XDP_PASS;
+    }
 
     /* Argmax */
     int best_label = 0;
@@ -534,10 +536,12 @@ int stage10(struct xdp_md *ctx)
 
     rewrite_packet(ctx, best_label);
 
-    bpf_printk("LABLE IS: %d", best_label);
+    // bpf_printk("LABLE IS: %d", best_label);
     dp->label = best_label;
     dp->classified = 1;
-    bpf_printk("CLASSIFIED! REWRITE & REDIRECT");
+    // bpf_printk("CLASSIFIED! REWRITE & REDIRECT");
+    __u64 done_ts = bpf_ktime_get_ns();
+    ac->proc_time += done_ts - ac->time_in;
    
     return XDP_PASS;
 }
@@ -546,11 +550,17 @@ int stage10(struct xdp_md *ctx)
 SEC("xdp")
 int classification(struct xdp_md *ctx)
 {
-    bpf_printk("START CLASSIFICATION");
+    // bpf_printk("START CLASSIFICATION");
     struct flow_key key = {};
     __u64 pkt_len = 0;
+    __u64 key_ac = 0;
+    accounting *ac = bpf_map_lookup_elem(&accounting_map, &key_ac);
+    if (!ac){
+        return XDP_PASS;
+    }
+    ac->time_in = bpf_ktime_get_ns();
     int ret = parse_packet_get_data(ctx, &key, &pkt_len);
-    bpf_printk("DONE PARSE PACKET");
+    // bpf_printk("DONE PARSE PACKET");
 
     if (ret == -2)      /* LLDP */
         return XDP_DROP;
@@ -558,13 +568,13 @@ int classification(struct xdp_md *ctx)
     if (ret < 0)
         return XDP_PASS;
 
-    int status = update_stats(&key, ctx);
-    bpf_printk("DONE UPDATE STATS");
+    int status = update_stats(&key, ctx, ac);
+    // bpf_printk("DONE UPDATE STATS");
     if (status == 0) {
         return XDP_PASS;
     }
     else if (status == 2) {
-        bpf_printk("CLASSIFIED! REWRITE & REDIRECT");
+        // bpf_printk("CLASSIFIED! REWRITE & REDIRECT");
 
         data_point *dp = bpf_map_lookup_elem(&xdp_flow_tracking, &key);
         if (!dp)
@@ -583,7 +593,9 @@ int classification(struct xdp_md *ctx)
         for (int i = 0; i < NUM_LABELS; i++)
             dp->votes[i] = 0;
 
-        bpf_printk("JUMP_TO_STAGE_0");
+        // bpf_printk("JUMP_TO_STAGE_0");
+        ac->total_bytes += pkt_len;
+        ac->total_pkts  += 1;
         bpf_tail_call(ctx, &prog_array, 0);
         return XDP_PASS;
     }

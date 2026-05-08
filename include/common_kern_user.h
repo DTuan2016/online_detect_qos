@@ -59,7 +59,14 @@ typedef struct {
     int     votes[NUM_LABELS];
     int     classified;
     int     label;
-} __attribute__((packed)) data_point;
+}data_point;
+
+struct event {
+    __u64   ts;
+    struct  flow_key key;
+    __u32   total_pkts;
+    __u64   features[MAX_FEATURES];
+};
 
 static __always_inline fixed fixed_from_uint(__u64 value)
 {

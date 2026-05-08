@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/bpf.h>
-#include <bpf/bpf_helpers.h>
+//#include <bpf/bpf_helpers.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/udp.h>
 #include <linux/tcp.h>
 #include <linux/icmp.h>
 #include <linux/in.h>
-#include <bpf/bpf_endian.h>
+//#include <bpf/bpf_endian.h>
 
 #include "common_kern_user.h"
 
@@ -31,6 +31,13 @@ struct {
     __type(value, accounting);
     __uint(max_entries, 1);
 } accounting_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(max_entries, 128);
+} events SEC(".maps");
 
 /* ================= PACKET PARSING ================= */
 static __always_inline int parse_packet_get_data(struct xdp_md *ctx,
@@ -163,6 +170,16 @@ static __always_inline int update_stats(struct flow_key *key, struct xdp_md *ctx
 
         if (new_total_pkts <= NUM_PACKET)
         {
+	    struct event evt = {};
+
+	    evt.ts = ts_ns;
+	    evt.key = *key;
+	    evt.total_pkts = new_total_pkts;
+            #pragma unroll
+	    for (int i = 0; i < MAX_FEATURES; i++) {
+	        evt.features[i] = dp->features[i];
+	    }
+	    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
             status = 1;
         }
         if (new_total_pkts > NUM_PACKET && dp->classified == 1){
@@ -182,6 +199,7 @@ int classification(struct xdp_md *ctx){
     if(!ac){
         return XDP_PASS;
     }
+    bpf_printk("TEST");
     ac->time_in = bpf_ktime_get_ns();
     int ret = parse_packet_get_data(ctx, &key, &pkt_len);
 
@@ -199,6 +217,7 @@ int classification(struct xdp_md *ctx){
     ac->total_bytes += pkt_len;
     ac->total_pkts += 1;
     bpf_redirect(REDIRECT_INTERFACE, 0);
+    return XDP_PASS;
 }
 
 char LICENSE[] SEC("license") = "GPL";

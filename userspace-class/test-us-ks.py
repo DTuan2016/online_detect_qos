@@ -4,11 +4,6 @@ import socket
 import struct
 import joblib
 import pandas as pd
-import csv
-import os
-
-CLOCK_MONOTONIC_RAW = 4
-
 # =========================================================
 # LIBBPF
 # =========================================================
@@ -20,20 +15,10 @@ libbpf = ctypes.CDLL("libbpf.so")
 # =========================================================
 
 EVENT_MAP = b"/sys/fs/bpf/eth0/events"
+FLOW_MAP  = b"/sys/fs/bpf/eth0/xdp_flow_tracking"
 
 FIXED_SHIFT = 16
 NUM_PACKET = 12
-
-CSV_FILE = "latency_log.csv"
-
-FEATURE_NAMES = [
-    "CurrenLength",
-    "SumIat",
-    "MinLen",
-    "MaxLen",
-    "SumLen",
-    "MeanLen"
-]
 
 # =========================================================
 # LOAD MODEL
@@ -43,30 +28,10 @@ rf_data = joblib.load(
     "../classification_model/rf_kernel_len_iat.pkl"
 )
 
+print(type(rf_data))
+print(rf_data.keys())
+
 rf_model = rf_data["model"]
-
-# =========================================================
-# CSV INIT
-# =========================================================
-
-csv_file = open(CSV_FILE, "w", newline="")
-
-csv_writer = csv.writer(csv_file)
-
-csv_writer.writerow([
-    "timestamp_ns",
-    "src_ip",
-    "src_port",
-    "dst_ip",
-    "dst_port",
-    "proto",
-    "pkt_id",
-    "prediction",
-    "confidence",
-    "latency_us"
-])
-
-csv_file.flush()
 
 # =========================================================
 # STRUCTS
@@ -106,13 +71,6 @@ SAMPLE_CB = ctypes.CFUNCTYPE(
 )
 
 # =========================================================
-# HELPERS
-# =========================================================
-
-def ip_to_str(ip):
-    return socket.inet_ntoa(struct.pack("I", ip))
-
-# =========================================================
 # OPEN PERF MAP
 # =========================================================
 
@@ -133,88 +91,34 @@ print("Perf map fd =", event_fd)
 
 @SAMPLE_CB
 def handle_event(ctx, cpu, data, size):
-
+    FEATURE_NAMES = ["CurrenLength", "SumIat", "MinLen", "MaxLen", "SumLen", "MeanLen" ]
     event = ctypes.cast(
         data,
         ctypes.POINTER(Event)
     ).contents
 
-    # =====================================================
-    # LATENCY
-    # =====================================================
+    t_user = time.monotonic_ns()
 
-    #t_user = time.monotonic_ns(CLOCK_MONOTONIC_RAW)
-    t_user = time.clock_gettime_ns(CLOCK_MONOTONIC_RAW)
     latency_us = (t_user - event.ts) / 1000.0
-
-    # =====================================================
-    # FEATURES
-    # =====================================================
 
     features = [
         float(event.features[i]) / (1 << FIXED_SHIFT)
         for i in range(6)
     ]
-
-    X = pd.DataFrame(
-        [features],
-        columns=FEATURE_NAMES
-    )
-
-    # =====================================================
-    # RF INFERENCE
-    # =====================================================
-
+    X = pd.DataFrame( [features], columns=FEATURE_NAMES )
+    #pred = rf_model.predict([features])[0]
     pred = rf_model.predict(X)[0]
-
     prob = rf_model.predict_proba(X)[0].max()
-
-    # =====================================================
-    # FLOW INFO
-    # =====================================================
-
-    src_ip = ip_to_str(event.key.src_ip)
-    dst_ip = ip_to_str(event.key.dst_ip)
-
-    # =====================================================
-    # PRINT
-    # =====================================================
-
+    #print(
+     #   f"pkt={event.total_pkts} "
+      #  f"pred={pred} "
+       # f"lat={latency_us:.2f} us"
+    #)
     print(
-        f"{src_ip}:{event.key.src_port}"
-        f" -> "
-        f"{dst_ip}:{event.key.dst_port} "
-        f"| pkt={event.total_pkts} "
-        f"| pred={pred} "
-        f"| conf={prob:.3f} "
-        f"| lat={latency_us:.2f} us"
-    )
-
-    # =====================================================
-    # CSV LOG
-    # =====================================================
-
-    csv_writer.writerow([
-        t_user,
-
-        src_ip,
-        event.key.src_port,
-
-        dst_ip,
-        event.key.dst_port,
-
-        event.key.proto,
-
-        event.total_pkts,
-
-        pred,
-
-        prob,
-
-        latency_us
-    ])
-
-    csv_file.flush()
+	f"pkt={event.total_pkts} "
+	f"pred={pred} " 
+	f"conf={prob:.3f} " 
+	f"lat={latency_us:.2f} us" )
 
 # =========================================================
 # PERF BUFFER NEW
@@ -241,18 +145,9 @@ print("Realtime inference started")
 # POLL LOOP
 # =========================================================
 
-try:
+while True:
 
-    while True:
-
-        libbpf.perf_buffer__poll(
-            pb,
-            1
-        )
-
-except KeyboardInterrupt:
-
-    print("\nStopping...")
-
-    csv_file.close()
-
+    libbpf.perf_buffer__poll(
+        pb,
+        1
+    )

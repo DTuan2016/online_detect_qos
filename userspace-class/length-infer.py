@@ -14,10 +14,10 @@ FEATURE_COLUMNS = [
     'flow_length_min',
     'flow_length_sum',
     'flow_length_mean',
-    'flow_iat_max',
-    'flow_iat_min',
-    'flow_iat_sum',
-    'flow_iat_mean',
+    'flow_length_median',
+    'flow_length_std',
+    'flow_length_q1',
+    'flow_length_q3'
 ]
 
 # =====================
@@ -27,7 +27,7 @@ IN_IFACE  = "eth0"
 OUT_IFACE = "veth-host"
 
 MODEL_PATH = os.path.expanduser(
-    "~/online_detect_qos/classification_model/randf_12p_9f_test.pkl"
+    "~/online_detect_qos/classification_model/randf_12p_9f_length.pkl"
 )
 
 MIN_PKTS_FOR_CLASSIFY = 12
@@ -105,39 +105,31 @@ def get_flow_key(pkt):
 
 import csv
 
-CSV_PATH = "./online_features.csv"
+CSV_PATH = "./length_features.csv"
 CSV_HEADER_WRITTEN = False
 
 def write_feature_csv(flow_key, flow, features, predicted_class):
-    #print(f"DEBUG: Dang ghi CSV cho flow {flow_key}...")
     global CSV_HEADER_WRITTEN
     file_exists = os.path.exists(CSV_PATH)
-    is_empty = not file_exists or os.stat(CSV_PATH).st_size == 0
     
     src_ip, dst_ip, proto, sport, dport = flow_key
-    #features = features.values[0]
-    if hasattr(features, "values"):
-        f_vals = features.values.flatten().tolist()
-    else:
-        f_vals = np.array(features).flatten().tolist()
+    f_vals = features.values.flatten().tolist()
+    
     row = {
         "src_ip": src_ip, "dst_ip": dst_ip, "proto": proto,
         "sport": sport, "dport": dport, "total_pkts": flow["total_pkts"],
-        "cur_len": f_vals[0], "max_len": f_vals[1], "min_len": f_vals[2],
-        "sum_len": f_vals[3], "mean_len": f_vals[4], "max_iat": f_vals[5],
-        "min_iat": f_vals[6], "sum_iat": f_vals[7], "mean_iat": f_vals[8],
+        "last_len": f_vals[0], "max_len": f_vals[1], "min_len": f_vals[2],
+        "sum_len": f_vals[3], "mean_len": f_vals[4], "median_len": f_vals[5],
+        "std_len": f_vals[6], "q1_len": f_vals[7], "q3_len": f_vals[8],
         "predicted_label": predicted_class
     }
 
     with open(CSV_PATH, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=row.keys())
-
         if not file_exists or not CSV_HEADER_WRITTEN:
             writer.writeheader()
             CSV_HEADER_WRITTEN = True
-
         writer.writerow(row)
-        f.flush()
 # =====================
 # FLOW UPDATE
 # =====================
@@ -155,11 +147,11 @@ def update_flow(pkt):
 
     if IP in pkt:
         # ntohs(ip->tot_len) + 14
-        pkt_len = pkt[IP].len + 14 
+        pkt_len = pkt[IP].len + 14
     else:
         # Trường hợp hiếm (không phải IPv4), giữ nguyên len gốc
         pkt_len = len(pkt)
-    
+
     if key not in flows:
 
         flows[key] = {
@@ -264,38 +256,30 @@ def debug_tree_path(model, features):
 # =====================
 
 def build_feature_vector(flow, pkt_len):
-
     if flow["total_pkts"] == 0:
         return None
 
-    duration = flow["last_seen"] - flow["start_ts"]
-
-    if duration == 0:
-        return None
-
-    mean_len = float(flow["sum_len"] / flow["total_pkts"])
-
-    mean_iat = 0
-
-    if flow["total_pkts"] > 1:
-        mean_iat = flow["sum_iat"] / (flow["total_pkts"] - 1)
-    # current_length,max_length,min_length,sum_length,mean_length,max_iat,min_iat,sum_iat,mean_iat
+    # Lưu độ dài gói tin vào một list để tính toán thống kê (nếu chưa có trong dict flow)
+    if "all_lens" not in flow:
+        flow["all_lens"] = []
+    flow["all_lens"].append(pkt_len)
+    
+    lens = pd.Series(flow["all_lens"])
+    
     feature_map = {
-        "flow_length_last": pkt_len,
-        "flow_length_max": flow["max_len"],
-        "flow_length_min": flow["min_len"],
-        "flow_length_sum": flow["sum_len"],
-        "flow_length_mean": mean_len,
-        "flow_iat_max": flow["max_iat"],
-        "flow_iat_min": flow["min_iat"] or 0,
-        "flow_iat_sum": flow["sum_iat"],
-        "flow_iat_mean": mean_iat,
+        "flow_length_last": float(pkt_len),
+        "flow_length_max": float(flow["max_len"]),
+        "flow_length_min": float(flow["min_len"]),
+        "flow_length_sum": float(flow["sum_len"]),
+        "flow_length_mean": float(lens.mean()),
+        "flow_length_median": float(lens.median()),
+        "flow_length_std": float(lens.std()) if len(lens) > 1 else 0.0,
+        "flow_length_q1": float(lens.quantile(0.25)),
+        "flow_length_q3": float(lens.quantile(0.75)),
     }
+    
     df = pd.DataFrame([[feature_map[f] for f in FEATURE_COLUMNS]], columns=FEATURE_COLUMNS)
-
-            
     return df
-
 
 # =====================
 # DSCP REWRITE
@@ -408,7 +392,7 @@ def process_packet(pkt):
             write_feature_csv(key, flow, features, predicted_class)
             cleanup_flows()
             return
-        
+
         # CASE 4: >12 nhưng chưa classified (edge-case)
         #debug_tree_path(classifier, features_scaled)
         predicted_class = classifier.predict(features_scaled)[0]
@@ -417,9 +401,9 @@ def process_packet(pkt):
 
         flow["classified"] = True
         flow["label"] = predicted_class
-	#write_feature_csv(key, flow, features, predicted_class)
+        #write_feature_csv(key, flow, features, predicted_class)
         #if features is not None:
-    	    #write_feature_csv(key, flow, features, -1)
+            #write_feature_csv(key, flow, features, -1)
         pkt = rewrite_dscp(pkt, predicted_class, key)
 
         out_socket.send(bytes(pkt))

@@ -24,6 +24,17 @@ message(FATAL_ERROR
 "Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")
 endif()
 
+# Detect multiarch include path (IMPORTANT for BPF compile)
+execute_process(
+    COMMAND gcc -print-multiarch
+    OUTPUT_VARIABLE MULTIARCH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+set(ARCH_INCLUDE_DIR /usr/include/${MULTIARCH})
+
+message(STATUS "Multiarch include dir: ${ARCH_INCLUDE_DIR}")
+
 message(STATUS "Host architecture : ${CMAKE_SYSTEM_PROCESSOR}")
 message(STATUS "BPF target arch   : ${BPF_ARCH}")
 
@@ -49,6 +60,7 @@ set(BPF_CFLAGS
     -D__TARGET_ARCH_${BPF_ARCH}
     -I${INC_DIR}
     -I${SRC_DIR}
+    -I${ARCH_INCLUDE_DIR}
 )
 
 # XDP BPF program

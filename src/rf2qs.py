@@ -195,7 +195,7 @@ def generate_common_header(
     header = f"""#ifndef COMMON_KERNEL_USER_H
 #define COMMON_KERNEL_USER_H
 
-#include <linux/types.h>
+//#include <linux/types.h>
 
 /* Fixed-point configuration */
 #define FIXED_SHIFT         {SCALE_BITS}
@@ -512,8 +512,8 @@ def main():
     print("Features:", max_features)
     print("Total nodes:", len(df))
     # Load BPF program
-    BUILD_DIR = "~/online_detect_qos/build"
-    XDP_LOADER_PATH = os.path.expanduser("~/online_detect_qos/build/xdp_loader")
+    BUILD_DIR = "~/qos_paper/online_detect_qos/build"
+    XDP_LOADER_PATH = os.path.expanduser("~/qos_paper/online_detect_qos/build/xdp_loader")
 
     # build
     run("make", cwd=BUILD_DIR)

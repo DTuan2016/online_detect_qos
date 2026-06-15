@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
-#include <linux/bpf.h>
+#include "vmlinux.h"
+
 #include <bpf/bpf_helpers.h>
-#include <linux/if_ether.h>
-#include <linux/ip.h>
-#include <linux/udp.h>
-#include <linux/tcp.h>
-#include <linux/icmp.h>
-#include <linux/in.h>
 #include <bpf/bpf_endian.h>
 
 #include "common_kern_user.h"
+#define ETH_P_IP 0x0800
 
 #define NANOSEC_PER_SEC 1000000000ULL
 
@@ -83,17 +79,17 @@ static __always_inline int parse_packet_get_data(struct xdp_md *ctx,
         if ((void *)(tcph + 1) > data_end) return -1;
         key->src_port = tcph->source;
         key->dst_port = tcph->dest;
-    	if (tcph->source == __constant_htons(53) || tcph->dest == __constant_htons(53)){
-	    return -1;
-	}
+    	if (tcph->source == bpf_htons(53) || tcph->dest   == bpf_htons(53)){
+            return -1;
+        }
     } else if (iph->protocol == IPPROTO_UDP) {
         struct udphdr *udph = (struct udphdr *)((__u8 *)iph + (iph->ihl * 4));
         if ((void *)(udph + 1) > data_end) return -1;
         key->src_port = udph->source;
         key->dst_port = udph->dest;
-	if (udph->source == __constant_htons(53) || udph->dest == __constant_htons(53)){
-	    return -1;
-    }
+        if (udph->source == bpf_htons(53) || udph->dest   == bpf_htons(53)){
+            return -1;
+        }
     } else {
         key->src_port = 0;
         key->dst_port = 0;

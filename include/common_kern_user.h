@@ -1,18 +1,18 @@
 #ifndef COMMON_KERNEL_USER_H
 #define COMMON_KERNEL_USER_H
 
-#include <linux/types.h>
+//#include <linux/types.h>
 
 /* Fixed-point configuration */
 #define FIXED_SHIFT         16
 #define FIXED_SCALE         65536
 #define MAX_TREES           300
-#define MAX_NODE_PER_TREE   2697
-#define MAX_FEATURES        9
-#define MAX_DEPTH           14
-#define TOTAL_NODES         809100
+#define MAX_NODE_PER_TREE   1195
+#define MAX_FEATURES        6
+#define MAX_DEPTH           35
+#define TOTAL_NODES         358500
 #define NUM_PACKET          12
-#define REDIRECT_INTERFACE  6
+#define REDIRECT_INTERFACE  10
 #define MAX_FLOW_SAVED      1000000
 #define NUM_LABELS          7
 #define NS_TO_SEC_FIXED(x) ((__u32)(((x) << 16) / 1000000000ULL))

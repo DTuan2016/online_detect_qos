@@ -1,7 +1,7 @@
 #ifndef COMMON_KERNEL_USER_H
 #define COMMON_KERNEL_USER_H
 
-#include <linux/types.h>
+// #include <linux/types.h>
 
 /* Fixed-point configuration */
 #define FIXED_SHIFT         16

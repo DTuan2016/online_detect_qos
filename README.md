@@ -148,11 +148,11 @@ cd online_detect_qos
 ```
 - **Compile libbpf, xdp-tools:**
 ```bash
-cd external/libbpf
+cd external/libbpf/src
 make
 sudo make install
 
-cd ../xdp-tools
+cd ../../xdp-tools
 make
 sudo make install
 

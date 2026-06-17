@@ -1,8 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0
-#include "vmlinux.h"
-
+// #include "vmlinux.h"
+#include <linux/types.h>
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
+#include <linux/icmp.h>
+#include <linux/in.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
+#include <stdbool.h>
 
 #include "common_kern_user.h"
 

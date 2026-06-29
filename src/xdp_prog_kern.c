@@ -1,51 +1,94 @@
 // SPDX-License-Identifier: GPL-2.0
+// Pipeline:
+//   xdp_anomaly_detector()
+//     → parse_packet_get_data()
+//     → update_stats()  [cập nhật flow stats]
+//       → nếu đủ ngưỡng: predict_forest()  [QS inference]
+//         → XDP_DROP nếu attack, XDP_PASS/redirect nếu benign
+//
+// QuickScorer Algorithm 2 (Lucchese et al. 2015):
+//   v[h] = 111...1  (init: all leaves are candidates)
+//   For each feature k, scan threshold[offsets[k]..offsets[k+1]):
+//     if feat < threshold[i]:  v[tree_ids[i]] &= bitvectors[i]
+//     else: break              (sorted asc → remaining all TRUE)
+//   exit_leaf[h] = msb_index(v[h])
+//   label = leaves[leaf_base[h] + exit_leaf[h]]
+
+// #include <linux/bpf.h>
+// #include <bpf/bpf_helpers.h>
+// #include <linux/if_ether.h>
+// #include <linux/ip.h>
+// #include <linux/tcp.h>
+// #include <linux/udp.h>
+// #include <linux/icmp.h>
+// #include <linux/in.h>
+// #include <bpf/bpf_endian.h>
 #include "vmlinux.h"
 
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
 #include <bpf/bpf_endian.h>
 
 #include "common_kern_user.h"
-#define ETH_P_IP 0x0800
-
-#define NANOSEC_PER_SEC 1000000000ULL
 
 #ifndef lock_xadd
 #define lock_xadd(ptr, val) ((void)__sync_fetch_and_add((ptr), (val)))
 #endif
 
-/* ================= MAPS ================= */
+/* ================================================================
+ * BPF MAPS
+ * ================================================================ */
+
+/* Per-flow tracking (PERCPU để tránh lock) */
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, struct flow_key);
-    __type(value, data_point);
+    __uint(type,        BPF_MAP_TYPE_PERCPU_HASH);
+    __type(key,         struct flow_key);
+    __type(value,       data_point);
     __uint(max_entries, MAX_FLOW_SAVED);
 } xdp_flow_tracking SEC(".maps");
 
+/* Flows bị drop (attack) */
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __type(key, __u32);
-    __type(value, accounting);
+    __uint(type,        BPF_MAP_TYPE_PERCPU_HASH);
+    __type(key,         struct flow_key);
+    __type(value,       data_point);
+    __uint(max_entries, MAX_FLOW_SAVED);
+} xdp_flow_dropped SEC(".maps");
+
+/* QuickScorer model: 1 entry, toàn bộ qsDataStruct
+ * (không cần 6 map riêng → tránh bpf_map_lookup trong inner loop) */
+struct {
+    __uint(type,        BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
+    __type(key,         __u32);
+    __type(value,       struct qsDataStruct);
+} qs_forest SEC(".maps");
+
+/* Accounting / latency */
+struct {
+    __uint(type,        BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key,         __u32);
+    __type(value,       accounting);
 } accounting_map SEC(".maps");
 
+/* Tổng số flow đã tạo */
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, MAX_TREES * MAX_NODE_PER_TREE);
-    __type(key, __u32);
-    __type(value, Node);
-} xdp_randforest_nodes SEC(".maps");
+    __uint(type,        BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key,         __u32);
+    __type(value,       __u32);
+} flow_counter SEC(".maps");
 
-struct {
-    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-    __uint(max_entries, 11);
-    __type(key, __u32);
-    __type(value, __u32);
-} prog_array SEC(".maps");
 
-/* ================= PACKET PARSING ================= */
-static __always_inline int parse_packet_get_data(struct xdp_md *ctx,
-                                                 struct flow_key *key,
-                                                 __u64 *pkt_len)
+/* ================================================================
+ * PACKET PARSING
+ * ================================================================ */
+
+static __always_inline int
+parse_packet_get_data(struct xdp_md *ctx,
+                      struct flow_key *key,
+                      __u64 *pkt_len)
 {
     void *data_end = (void *)(long)ctx->data_end;
     void *data     = (void *)(long)ctx->data;
@@ -55,7 +98,7 @@ static __always_inline int parse_packet_get_data(struct xdp_md *ctx,
         return -1;
 
     if (eth->h_proto == bpf_htons(0x88cc))
-        return -2; // drop LLDP
+        return -2;  /* LLDP → drop */
 
     if (eth->h_proto != bpf_htons(ETH_P_IP))
         return -1;
@@ -69,532 +112,274 @@ static __always_inline int parse_packet_get_data(struct xdp_md *ctx,
     key->proto  = iph->protocol;
 
     if (iph->protocol == IPPROTO_ICMP) {
-        struct icmphdr *icmp = (struct icmphdr *)((__u8 *)iph + (iph->ihl * 4));
+        struct icmphdr *icmp =
+            (struct icmphdr *)((__u8 *)iph + iph->ihl * 4);
         if ((void *)(icmp + 1) > data_end)
             return -1;
-    }
 
-    if (iph->protocol == IPPROTO_TCP) {
-        struct tcphdr *tcph = (struct tcphdr *)((__u8 *)iph + (iph->ihl * 4));
+        /* Whitelist ICMP loopback */
+        __u32 src = bpf_ntohl(iph->saddr);
+        __u32 dst = bpf_ntohl(iph->daddr);
+        if ((src == 0xC0A83203 && dst == 0xC0A83204 && icmp->type == 8) ||
+            (src == 0xC0A83204 && dst == 0xC0A83203 && icmp->type == 0) ||
+            (src == 0xC0A8331E  || dst == 0xC0A8331E))
+            return 1;  /* pass silently */
+
+        key->src_port = 0;
+        key->dst_port = 0;
+
+    } else if (iph->protocol == IPPROTO_TCP) {
+        struct tcphdr *tcph =
+            (struct tcphdr *)((__u8 *)iph + iph->ihl * 4);
         if ((void *)(tcph + 1) > data_end) return -1;
-        key->src_port = tcph->source;
-        key->dst_port = tcph->dest;
-    	if (tcph->source == bpf_htons(53) || tcph->dest   == bpf_htons(53)){
-            return -1;
-        }
+        key->src_port = bpf_ntohs(tcph->source);
+        key->dst_port = bpf_ntohs(tcph->dest);
+
     } else if (iph->protocol == IPPROTO_UDP) {
-        struct udphdr *udph = (struct udphdr *)((__u8 *)iph + (iph->ihl * 4));
+        struct udphdr *udph =
+            (struct udphdr *)((__u8 *)iph + iph->ihl * 4);
         if ((void *)(udph + 1) > data_end) return -1;
-        key->src_port = udph->source;
-        key->dst_port = udph->dest;
-        if (udph->source == bpf_htons(53) || udph->dest   == bpf_htons(53)){
-            return -1;
-        }
+        key->src_port = bpf_ntohs(udph->source);
+        key->dst_port = bpf_ntohs(udph->dest);
+
     } else {
         key->src_port = 0;
         key->dst_port = 0;
     }
 
-    key->src_port = bpf_ntohs(key->src_port);
-    key->dst_port = bpf_ntohs(key->dst_port);
     *pkt_len = (__u64)((__u8 *)data_end - (__u8 *)data);
     return 0;
 }
 
-static __always_inline int debug_traverse_tree(__u32 root_idx, data_point *dp)
+
+/* ================================================================
+ * QUICKSCORER — Step 2: vote
+ *
+ * Với mỗi cây h:
+ *   exit_leaf = msb_index(v[h])  (bit CAO nhất = leftmost candidate)
+ *   label = leaves[leaf_base[h] + exit_leaf]
+ *   votes += label
+ *
+ * Dùng QS_VOTE_BLOCK macro (defined trong header) để verifier
+ * thấy constant index cho mỗi cây.
+ * ================================================================ */
+
+static __always_inline __u64
+qs_vote_all(struct qsDataStruct *tree)
 {
-    __u32 node_idx = root_idx;
+    __u64 votes = 0;
 
-    #pragma unroll MAX_DEPTH
-    for (int depth = 0; depth < MAX_DEPTH; depth++) {
+    /* Expand 70 cây bằng macro để verifier xử lý được */
+    #pragma unroll
+    for (int h = 0; h < QS_NUM_TREES; h++) {
+        BITVECTOR_TYPE exit_leaf_idx =
+            (BITVECTOR_TYPE)(__u8)msb_index(tree->v[h]);
 
-        if (node_idx >= (MAX_TREES * MAX_NODE_PER_TREE)) {
-            // bpf_printk("TREE ERR: node_idx overflow %u", node_idx);
-            return -1;
-        }
+        __u8 num_leaves = tree->num_leaves_per_tree[h];
+        if (exit_leaf_idx >= num_leaves)
+            continue;
 
-        Node *node = bpf_map_lookup_elem(&xdp_randforest_nodes, &node_idx);
-        if (!node) {
-            // bpf_printk("TREE ERR: node NULL idx=%u", node_idx);
-            return -1;
-        }
+        /* leaf_base = h * QS_LAMBDA (uniform padding) */
+        __u64 leaf_base  = (__u64)h * QS_LAMBDA;
+        __u64 leaf_index = leaf_base + exit_leaf_idx;
 
-        /* Leaf node */
-        if (node->is_leaf) {
-            // bpf_printk("TREE LEAF depth=%d idx=%u label=%d",
-                    //    depth, node_idx, node->label);
-            return node->label;
-        }
+        if (leaf_index >= QS_NUM_LEAVES)
+            continue;
 
-        __u32 f_idx = node->feature_idx;
-        if (f_idx >= MAX_FEATURES) {
-            // bpf_printk("TREE ERR: feature_idx overflow %u", f_idx);
-            return -1;
-        }
-
-        /* giúp verifier hiểu rõ hơn */
-        fixed *features = dp->features;
-        fixed f_val = features[f_idx];
-        fixed split = node->split_value;
-
-        __u32 next_idx;
-
-        if (f_val <= split) {
-            next_idx = node->left_idx;
-            // bpf_printk(
-            //     "NODE depth=%d idx=%u f=%u val=%d split=%d -> LEFT %u",
-            //     depth, node_idx, f_idx, f_val, split, next_idx);
-        } else {
-            next_idx = node->right_idx;
-        //     bpf_printk(
-        //         "NODE depth=%d idx=%u f=%u val=%d split=%d -> RIGHT %u",
-        //         depth, node_idx, f_idx, f_val, split, next_idx);
-        }
-
-        if (next_idx == (__u32)-1 ||
-            next_idx >= (MAX_TREES * MAX_NODE_PER_TREE)) {
-
-            // bpf_printk("TREE ERR: invalid next_idx=%u", next_idx);
-            return -1;
-        }
-
-        node_idx = next_idx;
+        votes += tree->leaves[leaf_index];
     }
 
-    // bpf_printk("TREE WARN: reached MAX_DEPTH root=%u", root_idx);
-    return -1;
+    return votes;
 }
 
-/* ================= TREE INFERENCE ================= */
-static __always_inline int predict_one_tree(__u32 root_idx, data_point *dp)
-{
-    __u32 node_idx = root_idx;
 
-    #pragma unroll MAX_DEPTH
-    for (int depth = 0; depth < MAX_DEPTH; depth++) {
-        if (node_idx >= (MAX_TREES * MAX_NODE_PER_TREE)) {
-            return 0;
-        }
+/* ================================================================
+ * QUICKSCORER INFERENCE
+ *
+ * 1. Reset v[h] = 111...1 cho tất cả cây
+ * 2. QS_FEATURE cho từng feature (macro trong header)
+ * 3. qs_vote_all → majority vote
+ * ================================================================ */
 
-        Node *node = bpf_map_lookup_elem(&xdp_randforest_nodes, &node_idx);
-        if (!node){
-            return 0;
-        }
-        if (node->is_leaf) {
-            // bpf_printk("NODE LA: idx=%u, label=%d", node_idx, node->label);
-            return node->label;
-        }
-        __u32 f_idx = node->feature_idx;
-        if (f_idx >= MAX_FEATURES){
-            return 0;
-        }
-        fixed f_val = dp->features[f_idx];
-        fixed split = node->split_value;
-
-        __u32 next_idx;
-        if (f_val <= split) {
-            next_idx = node->left_idx;
-        } else {
-            next_idx = node->right_idx;
-        }
-
-        if (next_idx == (__u32)-1 || next_idx >= (MAX_TREES * MAX_NODE_PER_TREE)) {
-            return 0;
-        }
-
-        node_idx = next_idx;
-    }
-    // bpf_printk("Reached MAX_DEPTH: root_idx=%u", root_idx);
-    return 0;
-}
-
-static __always_inline void update_ipv4_csum_u8(struct iphdr *iph,
-                                                __u8 old_val,
-                                                __u8 new_val)
-{
-    __u32 check = (__u32)~iph->check & 0xFFFF;
-
-    check += (__u32)(~old_val) & 0xFF;
-    check += (__u32)new_val;
-
-    check = (check & 0xFFFF) + (check >> 16);
-    check = (check & 0xFFFF) + (check >> 16);
-
-    iph->check = ~((__u16)check);
-}
-
-static __always_inline int rewrite_packet(struct xdp_md *ctx, __u8 label)
-{
-    void *data_end = (void *)(long)ctx->data_end;
-    void *data     = (void *)(long)ctx->data;
-
-    struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end)
-        return XDP_PASS;
-
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return XDP_PASS;
-
-    struct iphdr *iph = (struct iphdr *)(eth + 1);
-    if ((void *)(iph + 1) > data_end)
-        return XDP_PASS;
-
-    __u8 dscp;
-
-    switch (label) {
-    case 0: dscp = 0; break;    // 0: BROWSING
-    case 1: dscp = 8; break;    // 1: CHAT
-    case 2: dscp = 16; break;   // 2: FT
-    case 3: dscp = 24; break;   // 3: P2P
-    case 4: dscp = 32; break;   // 4: STREAMING
-    case 5: dscp = 40; break;   // 5: VOIP
-    case 6: dscp = 48; break;   // 6: MAIL
-    default:
-        return XDP_PASS;
-    }
-
-    // __u8 new_tos = (dscp << 2) | ecn;
-
-    if (label >= 7 || label < 0)
-        return XDP_PASS;
-
-    __u8 old_tos = iph->tos;
-    __u8 ecn = old_tos & 0x03;
-
-    __u8 new_tos = (dscp << 2) | ecn;
-
-    if (old_tos == new_tos)
-        return XDP_PASS;
-
-    iph->tos = new_tos;
-
-    update_ipv4_csum_u8(iph, old_tos, new_tos);
-
-    return XDP_PASS;
-}
-
-/* ================= FLOW STATS ================= */
 static __always_inline int
-update_stats(struct flow_key *key, struct xdp_md *ctx, accounting *ac)
-{
-    __u64 ts_ns = bpf_ktime_get_ns();
-    __u64 pkt_len = (__u64)((__u8 *)(long)ctx->data_end -
-                            (__u8 *)(long)ctx->data);
-
-    int status = 0; // Khong detect, = 1 -> Detect, = 2 -> Classified
-
-    data_point *dp = bpf_map_lookup_elem(&xdp_flow_tracking, key);
-    if (!dp) {
-        data_point zero = {};
-
-        zero.start_ts     = ts_ns;
-        zero.last_seen    = ts_ns;
-        zero.total_pkts   = 1;
-        zero.total_bytes  = pkt_len;
-	    zero.sum_iat      = 0;
-
-        /* Packet length init */
-        zero.min_len  = pkt_len;
-        zero.max_len  = pkt_len;
-        zero.sum_len  = pkt_len;
-        zero.mean_len = pkt_len << FIXED_SHIFT;
-        zero.label      = -1;
-        zero.classified = 0;
-
-        int ret = bpf_map_update_elem(&xdp_flow_tracking, key, &zero, BPF_ANY);
-        if (ret == 0) {
-            __sync_fetch_and_add(&ac->flow_created, 1);
-        }
-        return XDP_PASS;
-    }
-    else{
-        /* increment first */
-        __sync_fetch_and_add(&dp->total_pkts, 1);
-
-        /* then read updated value */
-        __u64 new_total_pkts = dp->total_pkts;
-
-        __sync_fetch_and_add(&dp->total_bytes, pkt_len);
-	
-	    __u64 iat_ns = 0;
-        if (ts_ns >= dp->last_seen){
-            iat_ns = ts_ns - dp->last_seen;
-        }
-        if(iat_ns > 0){
-            dp->sum_iat += iat_ns;
-        }
-        /* ================= PACKET LENGTH ================= */
-
-        if (pkt_len < dp->min_len)
-            dp->min_len = pkt_len;
-
-        if (pkt_len > dp->max_len)
-            dp->max_len = pkt_len;
-
-        dp->sum_len += pkt_len;
-        dp->mean_len = (dp->sum_len << FIXED_SHIFT) / new_total_pkts;
-        /* ================= UPDATE TIME ================= */
-        dp->last_seen = ts_ns;
-        /* ================= FEATURE ARRAY ================= */ 
-        dp->features[FEATURE_CUR_LEN]    = fixed_from_uint(pkt_len);
-	    dp->features[FEATURE_SUM_IAT]    = (dp->sum_iat << FIXED_SHIFT)/1000000000;
-        dp->features[FEATURE_MIN_LEN]    = fixed_from_uint(dp->min_len);
-        dp->features[FEATURE_MAX_LEN]    = fixed_from_uint(dp->max_len);
-        dp->features[FEATURE_SUM_LEN]    = fixed_from_uint(dp->sum_len);
-        dp->features[FEATURE_MEAN_LEN]   = dp->mean_len;
-        /* ================= DETECTION ================= */
-        if (new_total_pkts <= NUM_PACKET)
-        {
-            status = 1;
-        }
-        if (new_total_pkts > NUM_PACKET && dp->classified == 1){
-            status = 2;
-        }
-    }
-    return status;
-}
-
-static __always_inline int process_stage(struct xdp_md *ctx,
-                                         data_point *dp,
-                                         __u32 stage_id,
-                                         __u32 tree_start,
-                                         __u32 tree_count)
+predict_forest(struct feat_vec fv)
 {
     __u32 key = 0;
+    struct qsDataStruct *tree =
+        bpf_map_lookup_elem(&qs_forest, &key);
+    if (!tree)
+        return 0;
 
-#pragma unroll
-    for (int t = 0; t < 30; t++) {
-        if (t >= tree_count)
-            break;
-
-        __u32 root = (tree_start + t) * MAX_NODE_PER_TREE;
-        // int pred = predict_one_tree(root, dp);
-        int pred = debug_traverse_tree(root, dp);
-        if (pred >= 0 && pred < NUM_LABELS)
-            dp->votes[pred]++;
-    }
-
-    /* tail call next stage */
-    __u32 next = stage_id + 1;
-    // bpf_printk("JUMP_TO_STAGE_%d", next);
-    bpf_tail_call(ctx, &prog_array, next);
-
-    /* nếu tail call fail */
-    return XDP_PASS;
-}
-
-static __always_inline data_point *get_dp_from_ctx(struct xdp_md *ctx)
-{
-    struct flow_key key = {};
-    __u64 pkt_len = 0;
-
-    int ret = parse_packet_get_data(ctx, &key, &pkt_len);
-    if (ret < 0)
-        return NULL;
-
-    data_point *dp =
-        bpf_map_lookup_elem(&xdp_flow_tracking, &key);
-
-    return dp;
-}
-
-SEC("xdp")
-int stage0(struct xdp_md *ctx)
-{
-    // bpf_printk("HERE_IS_STAGE_0");
-    data_point *dp = get_dp_from_ctx(ctx);
-    if (!dp)
-    {
-        // bpf_printk("GET_DP_FAIL");
-        return XDP_PASS;
-    }
-
-    // bpf_printk("GET_DP_SUCCESS");
-    return process_stage(ctx, dp, 0, 0, 30);
-}
-
-SEC("xdp")
-int stage1(struct xdp_md *ctx)
-{
-    data_point *dp = get_dp_from_ctx(ctx);
-    if (!dp)
-        return XDP_PASS;
-
-    return process_stage(ctx, dp, 1, 30, 30);
-}
-
-SEC("xdp")
-int stage2(struct xdp_md *ctx)
-{
-    data_point *dp = get_dp_from_ctx(ctx);
-    if (!dp)
-        return XDP_PASS;
-
-    return process_stage(ctx, dp, 2, 60, 30);
-}
-
-SEC("xdp")
-int stage3(struct xdp_md *ctx)
-{
-    data_point *dp = get_dp_from_ctx(ctx);
-    if(!dp){
-    	return XDP_PASS;
-    }
-    return process_stage(ctx, dp, 3, 90, 30);
-}
-
-SEC("xdp")
-int stage4(struct xdp_md *ctx)
-{
-    data_point *dp = get_dp_from_ctx(ctx);
-    if (!dp)
-        return XDP_PASS;
-
-    return process_stage(ctx, dp, 4, 120, 30);
-}
-
-SEC("xdp")
-int stage5(struct xdp_md *ctx)
-{
-    data_point *dp = get_dp_from_ctx(ctx);
-    if (!dp)
-        return XDP_PASS;
-
-    return process_stage(ctx, dp, 5, 150, 30);
-}
-
-SEC("xdp")
-int stage6(struct xdp_md *ctx)
-{
-    data_point *dp = get_dp_from_ctx(ctx);
-    if (!dp)
-        return XDP_PASS;
-
-    return process_stage(ctx, dp, 6, 180, 30);
-}
-
-SEC("xdp")
-int stage7(struct xdp_md *ctx)
-{
-    data_point *dp = get_dp_from_ctx(ctx);
-    if (!dp)
-        return XDP_PASS;
-
-    return process_stage(ctx, dp, 7, 210, 30);
-}
-
-SEC("xdp")
-int stage8(struct xdp_md *ctx)
-{
-    data_point *dp = get_dp_from_ctx(ctx);
-    if (!dp)
-        return XDP_PASS;
-
-    return process_stage(ctx, dp, 8, 240, 30);
-}
-
-SEC("xdp")
-int stage9(struct xdp_md *ctx)
-{
-    data_point *dp = get_dp_from_ctx(ctx);
-    if (!dp)
-        return XDP_PASS;
-
-    return process_stage(ctx, dp, 9, 270, 30);
-}
-
-SEC("xdp")
-int stage10(struct xdp_md *ctx)
-{
-    data_point *dp = get_dp_from_ctx(ctx);
-
-    __u64 key_ac = 0;
-    accounting *ac = bpf_map_lookup_elem(&accounting_map, &key_ac);
-
-    if(!ac){
-        return XDP_PASS;
-    }
-    if (!dp){
-        return XDP_PASS;
-    }
-
-    /* Argmax */
-    int best_label = 0;
-    int best_vote = dp->votes[0];
-
+    /* Reset v[] = 111...1 */
     #pragma unroll
-    for (int i = 1; i < NUM_LABELS; i++) {
-        if (dp->votes[i] > best_vote) {
-            best_vote = dp->votes[i];
-            best_label = i;
-        }
-    }
+    for (int h = 0; h < QS_NUM_TREES; h++)
+        tree->v[h] = ~(BITVECTOR_TYPE)0;
 
-    rewrite_packet(ctx, best_label);
+    /* QS Step 1: xử lý từng feature
+     * QS_FEATURE(feature_idx, offset_start, offset_end) */
+    QS_FEATURE(0, QS_OFFSETS_0, QS_OFFSETS_1);
+    QS_FEATURE(1, QS_OFFSETS_1, QS_OFFSETS_2);
+    QS_FEATURE(2, QS_OFFSETS_2, QS_OFFSETS_3);
+    QS_FEATURE(3, QS_OFFSETS_3, QS_OFFSETS_4);
+    QS_FEATURE(4, QS_OFFSETS_4, QS_OFFSETS_5);
+    QS_FEATURE(5, QS_OFFSETS_5, QS_OFFSETS_6);
 
-    // bpf_printk("LABLE IS: %d", best_label);
-    dp->label = best_label;
-    dp->classified = 1;
-    // bpf_printk("CLASSIFIED! REWRITE & REDIRECT");
-    __u64 done_ts = bpf_ktime_get_ns();
-    ac->proc_time += done_ts - ac->time_in;
-   
-    return XDP_PASS;
+    /* QS Step 2: vote */
+    __u64 votes = qs_vote_all(tree);
+
+    return (votes > (QS_NUM_TREES / 2)) ? 1 : 0;
 }
 
-/* ================= XDP ENTRY ================= */
-SEC("xdp")
-int classification(struct xdp_md *ctx)
-{
-    // bpf_printk("START CLASSIFICATION");
-    struct flow_key key = {};
-    __u64 pkt_len = 0;
-    __u64 key_ac = 0;
-    accounting *ac = bpf_map_lookup_elem(&accounting_map, &key_ac);
-    if (!ac){
-        return XDP_PASS;
-    }
-    ac->time_in = bpf_ktime_get_ns();
-    int ret = parse_packet_get_data(ctx, &key, &pkt_len);
-    // bpf_printk("DONE PARSE PACKET");
 
-    if (ret == -2)      /* LLDP */
+/* ================================================================
+ * FLOW STATS UPDATE
+ *
+ * Returns:
+ *   XDP_PASS  — benign hoặc chưa đủ ngưỡng
+ *   XDP_DROP  — attack detected
+ * ================================================================ */
+
+static __always_inline int
+update_stats(struct flow_key *key, struct xdp_md *ctx)
+{
+    __u64 ts_ns   = bpf_ktime_get_ns();
+    __u64 pkt_len = (__u64)((__u8 *)(long)ctx->data_end -
+                            (__u8 *)(long)ctx->data);
+    int ret = XDP_PASS;
+
+    data_point *dp = bpf_map_lookup_elem(&xdp_flow_tracking, key);
+
+    if (!dp) {
+        /* Flow mới: khởi tạo */
+        data_point z     = {};
+        z.start_ts       = ts_ns;
+        z.last_seen      = ts_ns;
+        z.min_IAT        = 0xFFFFFFFFFFFFFFFFULL;
+        z.total_pkts     = 1;
+        z.max_pkt_len    = (__u32)pkt_len;
+        z.min_pkt_len    = (__u32)pkt_len;
+        z.total_bytes    = (__u32)pkt_len;
+        z.label          = -1;
+
+        if (bpf_map_update_elem(&xdp_flow_tracking, key, &z, BPF_ANY) != 0)
+            return ret;
+
+        __u32 idx  = 0;
+        __u32 *cnt = bpf_map_lookup_elem(&flow_counter, &idx);
+        if (cnt)
+            __sync_fetch_and_add(cnt, 1);
+
+        return ret;
+    }
+
+    /* Flow đã tồn tại: cập nhật stats */
+    __u64 iat = (ts_ns >= dp->last_seen) ? ts_ns - dp->last_seen : 0;
+    if (iat > 0 && iat < dp->min_IAT)
+        dp->min_IAT = iat;
+
+    if ((__u32)pkt_len > dp->max_pkt_len) dp->max_pkt_len = (__u32)pkt_len;
+    if ((__u32)pkt_len < dp->min_pkt_len) dp->min_pkt_len = (__u32)pkt_len;
+
+    dp->last_seen = ts_ns;
+
+    /* BPF XADD: không dùng return value */
+    __sync_fetch_and_add(&dp->total_pkts,  1);
+    __sync_fetch_and_add(&dp->total_bytes, (__u32)pkt_len);
+
+    /* Kiểm tra ngưỡng phân loại */
+    __u64 flow_dur = dp->last_seen - dp->start_ts;
+    if (dp->total_pkts  >= FLOW_LEVEL_PKTS ||
+        flow_dur        >= FLOW_LEVEL_DUR_NS) {
+
+        struct feat_vec fv = {};
+        fv.features[0] = fixed_from_uint(flow_dur);
+        fv.features[1] = fixed_from_uint(dp->total_pkts);
+        fv.features[2] = fixed_from_uint(dp->total_bytes);
+        fv.features[3] = fixed_from_uint(dp->max_pkt_len);
+        fv.features[4] = fixed_from_uint(dp->min_pkt_len);
+        fv.features[5] = fixed_from_uint(dp->min_IAT);
+
+        int pred  = predict_forest(fv);
+        dp->label = pred;
+
+        if (pred == 0) {
+            ret = XDP_PASS;
+        } else {
+            ret = XDP_DROP;
+            bpf_map_update_elem(&xdp_flow_dropped, key, dp, BPF_ANY);
+        }
+
+        bpf_map_update_elem(&xdp_flow_tracking, key, dp, BPF_ANY);
+    }
+
+    return ret;
+}
+
+
+/* ================================================================
+ * XDP ENTRY — anomaly detector
+ * ================================================================ */
+
+SEC("xdp")
+int xdp_anomaly_detector(struct xdp_md *ctx)
+{
+    struct flow_key key     = {};
+    __u64           pkt_len = 0;
+    __u32           key_ac  = 0;
+
+    accounting *ac = bpf_map_lookup_elem(&accounting_map, &key_ac);
+    if (!ac)
+        return XDP_PASS;
+
+    ac->time_in = bpf_ktime_get_ns();
+
+    int ret = parse_packet_get_data(ctx, &key, &pkt_len);
+    if (ret == -2) return XDP_DROP;   /* LLDP        */
+    if (ret ==  1) return XDP_PASS;   /* ICMP whitelist */
+    if (ret <   0) return XDP_PASS;
+
+    ret = update_stats(&key, ctx);
+
+    __u64 time_out  = bpf_ktime_get_ns();
+    ac->proc_time  += time_out - ac->time_in;
+    ac->total_bytes += pkt_len;
+    ac->total_pkts  += 1;
+    bpf_map_update_elem(&accounting_map, &key_ac, ac, BPF_ANY);
+
+    if (ret == XDP_DROP)
         return XDP_DROP;
 
-    if (ret < 0)
-        return XDP_PASS;
-
-    int status = update_stats(&key, ctx, ac);
-    // bpf_printk("DONE UPDATE STATS");
-    if (status == 0) {
-        return XDP_PASS;
-    }
-    else if (status == 2) {
-        // bpf_printk("CLASSIFIED! REWRITE & REDIRECT");
-
-        data_point *dp = bpf_map_lookup_elem(&xdp_flow_tracking, &key);
-        if (!dp)
-            return XDP_PASS;
-
-        int best_label = dp->label;
-        rewrite_packet(ctx, best_label);
-        return XDP_PASS;
-    }
-    else{
-        data_point *dp = bpf_map_lookup_elem(&xdp_flow_tracking, &key);
-        if (!dp)
-            return XDP_PASS;
-
-        #pragma unroll
-        for (int i = 0; i < NUM_LABELS; i++)
-            dp->votes[i] = 0;
-
-        // bpf_printk("JUMP_TO_STAGE_0");
-        ac->total_bytes += pkt_len;
-        ac->total_pkts  += 1;
-        bpf_tail_call(ctx, &prog_array, 0);
-        return XDP_PASS;
-    }
+    return bpf_redirect(REDIRECT_INTERFACE, 0);
 }
 
-char LICENSE[] SEC("license") = "GPL";
+
+/* ================================================================
+ * XDP ENTRY — stats only (mirror / second interface)
+ * ================================================================ */
+
+SEC("xdp")
+int stats(struct xdp_md *ctx)
+{
+    struct flow_key key     = {};
+    __u64           pkt_len = 0;
+    __u32           key_ac  = 0;
+
+    accounting *ac = bpf_map_lookup_elem(&accounting_map, &key_ac);
+    if (!ac)
+        return XDP_PASS;
+
+    ac->time_in = bpf_ktime_get_ns();
+
+    if (parse_packet_get_data(ctx, &key, &pkt_len) != 0)
+        return XDP_PASS;
+
+    __u64 time_out = bpf_ktime_get_ns();
+    __sync_fetch_and_add(&ac->proc_time,   time_out - ac->time_in);
+    __sync_fetch_and_add(&ac->total_pkts,  1);
+    __sync_fetch_and_add(&ac->total_bytes, pkt_len);
+
+    bpf_map_update_elem(&accounting_map, &key_ac, ac, BPF_ANY);
+    return XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";
